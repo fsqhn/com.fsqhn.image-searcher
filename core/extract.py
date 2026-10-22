@@ -50,6 +50,15 @@ def promote_sotwe(url: str, title: str = "") -> tuple[str, str]:
     return f"https://x.com/{handle}", cleaned
 
 
+def is_x_platform(platform: str) -> bool:
+    """是否为 X / Twitter 结果。
+
+    用于「指纹距离相同优先用 X」的排序规则，只认平台名，不猜链接。
+    """
+    text = (platform or "").strip().lower()
+    return "twitter" in text or text in {"x", "x.com"}
+
+
 def platform_of(url: str = "", source: str = "", title: str = "") -> str:
     """判断结果所在平台。"""
     host = (urlparse(url).netloc or source or "").lower()

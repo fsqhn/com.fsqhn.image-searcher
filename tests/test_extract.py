@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.extract import (  # noqa: E402
     extract_identity,
+    is_x_platform,
     platform_of,
     promote_sotwe,
     relevance_rank,
@@ -113,6 +114,18 @@ class KeyPoolTest(unittest.TestCase):
         pool = KeyPool([])
         self.assertFalse(pool)
         self.assertIsNone(pool.acquire())
+
+
+class XPlatformPreferenceTest(unittest.TestCase):
+    def test_detects_x_platform(self) -> None:
+        self.assertTrue(is_x_platform("X (Twitter)"))
+        self.assertTrue(is_x_platform("x.com"))
+        self.assertTrue(is_x_platform("twitter"))
+
+    def test_other_platforms_are_not_x(self) -> None:
+        for platform in ("picazor.com", "B站", "抖音", "pixiv.net", ""):
+            with self.subTest(platform=platform):
+                self.assertFalse(is_x_platform(platform))
 
 
 if __name__ == "__main__":

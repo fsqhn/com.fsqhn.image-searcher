@@ -29,6 +29,7 @@ from .core.engines import (
     detect_ai,
     verify_candidate,
 )
+from .core.extract import is_x_platform
 from .core.hashing import dhash, prepare_upload
 from .core.httpclient import HttpError, download_image
 from .core.keypool import KeyPool
@@ -1110,13 +1111,24 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return None
 
     @staticmethod
+    def _is_x(item: Candidate) -> bool:
+        """X / Twitter 平台的结果在指纹距离相同时优先采用。"""
+        return is_x_platform(item.platform)
+
+    @staticmethod
     def _pick_best(ordered: list[Candidate]) -> Candidate | None:
         matches = [item for item in ordered if item.status == "match"]
         if not matches:
             return None
         hashed = [item for item in matches if item.distance is not None]
         if hashed:
-            return min(hashed, key=lambda item: item.distance if item.distance is not None else 999)
+            return min(
+                hashed,
+                key=lambda item: (
+                    item.distance if item.distance is not None else 999,
+                    0 if ImageSearcherPlugin._is_x(item) else 1,
+                ),
+            )
         return max(matches, key=lambda item: item.similarity or 0)
 
     def _rank(self, candidates: list[Candidate], names: list[str]) -> list[Candidate]:
@@ -1127,11 +1139,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
             distance = item.distance if item.distance is not None else 999
             similarity = -(item.similarity if item.similarity is not None else 0)
             # 引擎顺序放在质量之前：优先级就是展示顺序，照片 Lens 先、插画 SauceNAO 先。
+            # X / Twitter 只在指纹距离完全相同时插队，不会盖过更接近的图。
             return (
                 status_weight.get(item.status, 2),
                 order.get(item.engine, 99),
                 item.rank,
                 distance,
+                0 if self._is_x(item) else 1,
                 similarity,
             )
 
