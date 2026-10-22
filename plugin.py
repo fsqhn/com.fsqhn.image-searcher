@@ -1206,8 +1206,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
         try:
             sent = await self.ctx.send.forward(nodes, task.stream_id)
-            if sent is False:
-                raise RuntimeError("合并转发被拒绝")
+            self._vlog(
+                "合并转发已发送：task=%s replay=%s 节点=%s 返回类型=%s",
+                task.task_id,
+                replay,
+                len(nodes),
+                type(sent).__name__,
+            )
+            if not _send_ok(sent):
+                raise RuntimeError(f"合并转发被拒绝：{sent}")
         except Exception as error:  # noqa: BLE001
             self.ctx.logger.warning("合并转发失败，退回文字消息：%s", error)
             text = formatting.build_text_summary(
@@ -1216,7 +1223,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 show_reference=section.show_reference,
                 limit=limit,
             )
-            await self.ctx.send.text(text, task.stream_id)
+            fallback = await self.ctx.send.text(text, task.stream_id)
+            if not _send_ok(fallback):
+                self.ctx.logger.warning("转发退路也失败：task=%s 文本长度=%s", task.task_id, len(text))
 
     # -- 等图 -------------------------------------------------------------
 
