@@ -108,15 +108,15 @@ def build_forward_nodes(
             item["user_id"] = user_id
         return item
 
-    header = "🔍 麦麦寻人结果"
+    header = f"🔍 {command}结果"
     if outcome.status == "error":
-        header = "🔍 麦麦寻人 · 搜索失败"
+        header = f"🔍 {command} · 搜索失败"
     if replay:
-        header = "🔍 麦麦寻人结果 · 全部候选"
+        header = f"🔍 {command}结果 · 全部候选"
     if outcome.ai and outcome.ai.get("ok"):
         try:
             if float(outcome.ai.get("score") or 0) >= AI_FLAG_THRESHOLD:
-                header = "🔍 麦麦寻人 · 疑似 AI 生成"
+                header = f"🔍 {command} · 疑似 AI 生成"
         except (TypeError, ValueError):
             pass
 

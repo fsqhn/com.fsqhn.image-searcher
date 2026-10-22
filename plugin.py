@@ -37,6 +37,7 @@ from .core.maibot_compat import unwrap_capability
 from .core.tasks import SearchOutcome, SearchTask, TaskStore
 
 DEFAULT_COMMAND = "麦麦寻人"
+PLUGIN_NAME = "麦麦寻人"
 _BASE64_KEYS = ("binary_data_base64", "base64", "image_base64", "file_base64")
 _URL_KEYS = ("url", "image_url", "file_url", "download_url")
 
@@ -566,7 +567,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         restored = self._tasks.load() if self._tasks else 0
         enabled = [name for name in self.config.engines.priority if self._enabled(name)]
         self.ctx.logger.info(
-            "麦麦寻人已加载：指令=%s，引擎=%s，上限=%s，详细日志=%s，恢复任务=%s",
+            "%s已加载：指令=%s，引擎=%s，上限=%s，详细日志=%s，恢复任务=%s",
+            PLUGIN_NAME,
             COMMAND,
             "、".join(enabled) or "无",
             self._describe_limits(),
@@ -588,7 +590,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         self._image_cache.clear()
         self._engine_pool.shutdown(wait=False, cancel_futures=True)
         self._verify_pool.shutdown(wait=False, cancel_futures=True)
-        self.ctx.logger.info("麦麦寻人已卸载")
+        self.ctx.logger.info("%s已卸载", PLUGIN_NAME)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         if scope != "self":
@@ -603,7 +605,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     configured,
                     COMMAND,
                 )
-        self.ctx.logger.info("麦麦寻人配置已更新：上限=%s，版本=%s", self._describe_limits(), version or "无")
+        self.ctx.logger.info("%s配置已更新：上限=%s，版本=%s", PLUGIN_NAME, self._describe_limits(), version or "无")
 
     def _describe_limits(self) -> str:
         parts = []

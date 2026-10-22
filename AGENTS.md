@@ -34,6 +34,8 @@ core/maibot_compat.py  能力返回值解包
 
 **配置热更新有限**：`self.config` 会热更新，但 `@Command` 的 `pattern` 是模块导入时生成的。改 `command` / `aliases` 必须重载插件。
 
+**用户可见文案不要写死插件名**：转发标题、补图提示、「更多」提示统一用 `COMMAND`（来自配置），只有 `_manifest.json`、包名和 README 用固定的「麦麦寻人」。标题里写死会导致用户把指令改成别的名字后，卡片还顶着旧名字。
+
 ## 平台事实（2026-10-22 实测）
 
 | 事实 | 影响 |
@@ -98,5 +100,6 @@ python -m unittest discover -s tests -v
 - `config.toml` 不要提交；确认仓库里只有 `config.example.toml`。
 - 仓库内不要留 `plugin.py.upload_tmp`、`__pycache__`、日志、任务数据。
 - 不要在 README / AGENTS / 代码里出现真实 key、代理 IP、群号。
+- 不要提交个人环境的定制值（例如改过的 `command`、`nickname`、代理地址）；仓库只保留默认的「麦麦寻人」与示例配置。
 - **截图必须脱敏**：群名、昵称、QQ 头像、对方账号、露骨标题都要遮盖或打码；真人裸露照片不要放原图，README 里的效果图优先用虚构字段的示意图（`assets/preview-result.png` 就是脚本生成的）。
 - 提交前扫一遍：`grep -rn "@[A-Za-z0-9_]\{2,\}" README.md AGENTS.md` 与 `grep -rn "127.0.0.1\|OnlyFans" README.md`。

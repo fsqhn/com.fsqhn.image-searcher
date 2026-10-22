@@ -71,6 +71,13 @@ class ForwardNodesTest(unittest.TestCase):
         )
         self.assertIn("参考图", joined)
 
+    def test_header_follows_configured_command(self) -> None:
+        """指令可配置，转发标题也要跟着改，不能写死默认名。"""
+        outcome = SearchOutcome(status="ok", best=None, candidates=[], image_b64="")
+        nodes = build_forward_nodes(_task(outcome), command="示例指令")
+        header = nodes[0]["content"][0]["content"]
+        self.assertEqual(header, "🔍 示例指令结果")
+
     def test_nodes_carry_sender_uin(self) -> None:
         """uin 为空时 QQ 端会提示消息异常，所以每个节点都要带 user_id。"""
         outcome = SearchOutcome(status="not_found", best=None, candidates=[], image_b64="", image_source="")
