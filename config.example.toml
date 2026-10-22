@@ -90,6 +90,20 @@ route_similarity = 75
 # 免费账号单次最多返回 4 条
 max_results = 4
 
+# 库策略：控制 SauceNAO 查哪些索引库（db 参数）。
+# db=999 是全库，命中率高但可能带回成人站点；收紧到具体库命中率会下降。
+# 关闭开关时一律用「全量检索的库」。
+db_policy_enabled = false
+# 全量检索时用的库，999 表示全部。
+db = "999"
+# 收紧检索时用的库，逗号分隔。5=pixiv 6=twitter 21=anime-pictures 24=anime
+db_strict = "5,6,21,24"
+# 名单上的群走全量，名单外的群走收紧。可填群号（只填数字即可）或会话 ID，
+# 群号会自动映射成会话 ID，不用手动去 g 前缀。
+db_full_groups = []
+# 想反过来就把这个设成 true：名单上的群走收紧，其他群走全量。
+db_policy_invert = false
+
 [ai_detect]
 # Sightengine AI 生成图检测，只在「没有可靠匹配」时调用，节省额度。
 # 注册：https://dashboard.sightengine.com/signup

@@ -186,6 +186,44 @@ class SauceNaoConfig(EngineConfig):
         ge=1,
         le=20,
     )
+    db: str = Field(
+        default="999",
+        description="全量检索时传给 SauceNAO 的 db 参数。999 表示全部数据库。",
+        json_schema_extra=_ui("全量检索的库", "默认 999（全库）。一般不用改。", placeholder="999"),
+    )
+    db_strict: str = Field(
+        default="5,6,21,24",
+        description="收紧检索时用的 db 参数，逗号分隔。默认只查 pixiv、twitter、anime-pictures 等常用插画库。",
+        json_schema_extra=_ui(
+            "收紧检索的库",
+            "默认 5,6,21,24。收得越窄，越不容易带出成人站点，但冷门图可能搜不到。",
+            placeholder="5,6,21,24",
+        ),
+    )
+    db_policy_enabled: bool = Field(
+        default=False,
+        description="是否按群启用名单策略。关闭时所有群都用上面的「全量检索的库」。",
+        json_schema_extra=_ui(
+            "启用按群名单",
+            "打开后：名单里的群全量检索，其他群收紧。想反过来就把下面的「名单反转」打开。",
+        ),
+    )
+    db_full_groups: list[str] = Field(
+        default_factory=list,
+        description="名单里的群号。填群号即可（例如 123456789），也认会话 ID。",
+        json_schema_extra=_ui(
+            "名单（群号）",
+            "填群号，点「添加」可以加多个。默认这些群走全量，其他群收紧。",
+        ),
+    )
+    db_policy_invert: bool = Field(
+        default=False,
+        description="反转名单含义：打开后名单里的群收紧，其他群全量。",
+        json_schema_extra=_ui(
+            "名单反转",
+            "默认名单=全量。打开后名单=收紧，其他群=全量，适合只想在个别群限制的情况。",
+        ),
+    )
 
 
 class EnginesConfig(PluginConfigBase):
@@ -476,6 +514,21 @@ def _stream_id_of(message: Any) -> str:
     return ""
 
 
+def _group_id_of(message: Any) -> str:
+    """取群号，SauceNAO 的名单按群号匹配；私聊返回空。"""
+    if not isinstance(message, dict):
+        return ""
+    info = message.get("message_info")
+    if isinstance(info, dict):
+        group = info.get("group_info")
+        if isinstance(group, dict):
+            for key in ("group_id", "id", "group_code"):
+                value = group.get(key)
+                if value:
+                    return str(value)
+    return ""
+
+
 def _user_id_of(message: Any) -> str:
     """从消息字典里尽量挖出用户 ID：钩子侧和指令侧的结构不完全一致。"""
     if not isinstance(message, dict):
@@ -539,6 +592,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         self._pending_timers: dict[tuple[str, str], asyncio.Task] = {}
         # 合并转发节点的 uin 不能为空，否则 QQ 端会提示消息异常；从入站消息里记机器人账号。
         self._self_id: str = ""
+        # SauceNAO 的库策略按群配置，但 stream_id 是哈希，需要群号映射。
+        self._stream_groups: dict[str, str] = {}
         # 消息入库有延迟：指令触发时按 ID 查库往往还是空，所以在入站钩子里先存一份二进制。
         self._image_cache: dict[str, tuple[float, bytes]] = {}
         # 引擎请求与候选图验证分池：引擎是长请求，验证是短下载，
@@ -639,8 +694,25 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 global_proxy,
                 section.engine_timeout,
                 config.saucenao.min_similarity,
+                db_full=config.saucenao.db,
+                db_strict=config.saucenao.db_strict,
+                policy_enabled=config.saucenao.db_policy_enabled,
+                invert=config.saucenao.db_policy_invert,
+                groups=config.saucenao.db_full_groups,
+                group_of=self._group_of,
             ),
         }
+
+    def _group_of(self, stream_id: str) -> str:
+        """会话 ID → 群号，SauceNAO 的名单按群号匹配用。"""
+        if not stream_id:
+            return ""
+        return self._stream_groups.get(stream_id, "")
+
+    def _remember_group(self, stream_id: str, group_id: str) -> None:
+        self._stream_groups[stream_id] = group_id
+        if len(self._stream_groups) > 200:
+            self._stream_groups.pop(next(iter(self._stream_groups)), None)
 
     def _enabled(self, name: str) -> bool:
         config = getattr(self.config, name, None)
@@ -713,6 +785,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
             account_id = str(message.get("account_id") or message.get("self_id") or "").strip()
             if account_id:
                 self._self_id = account_id
+            group_id = _group_id_of(message)
+            if group_id:
+                key = stream_id or _stream_id_of(message)
+                if key:
+                    self._remember_group(key, group_id)
             raw = self._remember_image(message)
             # 等待窗口内的补图直接在这里接住：靠指令正则的话，VLM 没出描述时
             # 消息文本是空字符串，压根匹配不上。
@@ -967,13 +1044,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
     # -- 搜索 -------------------------------------------------------------
 
-    def _call_engine(self, name: str, image: bytes, image_url: str) -> list[Candidate]:
+    def _call_engine(self, name: str, image: bytes, image_url: str, stream_id: str) -> list[Candidate]:
         engine = self._engines.get(name)
         if engine is None:
             raise EngineError(f"未知引擎 {name}")
-        return engine.search(image, image_url)
+        return engine.search(image, image_url, stream_id)
 
-    async def _search(self, raw: bytes, image_url: str = "") -> SearchOutcome:
+    async def _search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> SearchOutcome:
         config = self.config
         section = config.plugin
         started = time.time()
@@ -988,7 +1065,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         loop = asyncio.get_running_loop()
         coros = [
             asyncio.wait_for(
-                loop.run_in_executor(self._engine_pool, self._call_engine, name, upload, image_url),
+                loop.run_in_executor(self._engine_pool, self._call_engine, name, upload, image_url, stream_id),
                 timeout=timeout,
             )
             for name in names
@@ -1181,7 +1258,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
     async def _run_task(self, task: SearchTask, raw: bytes, image_url: str, notify: bool) -> None:
         try:
-            outcome = await self._search(raw, image_url)
+            outcome = await self._search(raw, image_url, task.stream_id)
             if self._tasks:
                 self._tasks.finish(task, outcome)
             self._vlog(

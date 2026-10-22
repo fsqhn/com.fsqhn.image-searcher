@@ -10,6 +10,7 @@ from __future__ import annotations
 import html as html_lib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -102,7 +103,7 @@ class LensEngine:
         self.proxy = proxy
         self.timeout = timeout
 
-    def search(self, raw: bytes, image_url: str = "") -> list[Candidate]:
+    def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
         key = self.pool.acquire()
         if not key:
             raise EngineError("没有可用的 SerpAPI key（未配置或全部冷却）")
@@ -190,7 +191,7 @@ class YandexEngine:
         self.proxy = proxy
         self.timeout = timeout
 
-    def search(self, raw: bytes, image_url: str = "") -> list[Candidate]:
+    def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
         last_error = ""
         for host in YANDEX_HOSTS:
             for attempt in (1, 2):
@@ -274,7 +275,7 @@ class BaiduEngine:
         self.proxy = proxy
         self.timeout = timeout
 
-    def search(self, raw: bytes, image_url: str = "") -> list[Candidate]:
+    def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
         session = make_session(self.proxy, headers={"Acs-Token": ""})
         try:
             upload = session.post(
@@ -365,6 +366,42 @@ def to_baidu_candidate(item: dict, engine: str) -> Candidate | None:
 # ---------------------------------------------------------------------------
 
 
+def group_listed(groups: list[str], stream_id: str, group_id: str) -> bool:
+    """名单里可以写群号，也可以写会话 ID，两种都认（`g` 前缀自动忽略）。"""
+
+    def norm(value: str) -> str:
+        return str(value).strip().lstrip("g")
+
+    wanted = {norm(item) for item in groups if str(item).strip()}
+    if not wanted:
+        return False
+    candidates = [group_id, stream_id, stream_id.lstrip("g")]
+    return any(value and norm(value) in wanted for value in candidates)
+
+
+def resolve_saucenao_db(
+    *,
+    db_full: str,
+    db_strict: str,
+    policy_enabled: bool,
+    invert: bool,
+    groups: list[str],
+    stream_id: str,
+    group_id: str,
+) -> str:
+    """按群决定 SauceNAO 用哪个库。
+
+    关闭名单策略时一律走全量；打开后默认「名单上的群全量、其他群收紧」，
+    invert 反转为「名单上的群收紧、其他群全量」。
+    """
+    if not policy_enabled or not groups:
+        return db_full
+    listed = group_listed(groups, stream_id, group_id)
+    if invert:
+        return db_strict if listed else db_full
+    return db_full if listed else db_strict
+
+
 class SauceNaoEngine:
     """SauceNAO 自带相似度，直接采用，不再做指纹比对。"""
 
@@ -376,20 +413,49 @@ class SauceNaoEngine:
         proxy: str = "",
         timeout: float = 30.0,
         min_similarity: float = 60.0,
+        db_full: str = "999",
+        db_strict: str = "5,6,21,24",
+        policy_enabled: bool = False,
+        invert: bool = False,
+        groups: list[str] | None = None,
+        group_of: Callable[[str], str] | None = None,
     ) -> None:
         self.pool = pool
         self.proxy = proxy
         self.timeout = timeout
         self.min_similarity = min_similarity
+        self.db_full = db_full
+        self.db_strict = db_strict
+        self.policy_enabled = policy_enabled
+        self.invert = invert
+        self.groups = list(groups or [])
+        self.group_of = group_of
 
-    def search(self, raw: bytes, image_url: str = "") -> list[Candidate]:
+    def _db_for(self, stream_id: str) -> str:
+        group_id = ""
+        if self.group_of is not None and stream_id:
+            try:
+                group_id = str(self.group_of(stream_id) or "")
+            except Exception:  # noqa: BLE001 - 查不到就按名单外处理
+                group_id = ""
+        return resolve_saucenao_db(
+            db_full=self.db_full,
+            db_strict=self.db_strict,
+            policy_enabled=self.policy_enabled,
+            invert=self.invert,
+            groups=self.groups,
+            stream_id=stream_id,
+            group_id=group_id,
+        )
+
+    def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
         key = self.pool.acquire()
         if key is None:
             if self.pool.keys:
                 raise EngineError("SauceNAO key 全部冷却中")
             raise EngineError("未配置 SauceNAO API key（匿名接口已不开放）")
 
-        data = {"output_type": "2", "db": "999", "numres": "8", "minsim": "30"}
+        data = {"output_type": "2", "db": self._db_for(stream_id), "numres": "8", "minsim": "30"}
         if key:
             data["api_key"] = key
 

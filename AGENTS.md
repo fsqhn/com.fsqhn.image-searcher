@@ -36,6 +36,10 @@ core/maibot_compat.py  能力返回值解包
 
 **用户可见文案不要写死插件名**：转发标题、补图提示、「更多」提示统一用 `COMMAND`（来自配置），只有 `_manifest.json`、包名和 README 用固定的「麦麦寻人」。标题里写死会导致用户把指令改成别的名字后，卡片还顶着旧名字。
 
+**SauceNAO 库策略**：`db` 是全量库，`db_strict` 是收紧库，`db_policy_enabled` 开关，`db_full_groups` 名单，`db_policy_invert` 反转含义。选库逻辑在 `core/engines.py` 的 `resolve_saucenao_db()`，纯函数、有独立用例（`tests/test_dbpolicy.py`），改语义先改那里的测试。开关关闭或名单为空时一律走 `db`。
+
+**群号到会话 ID 的映射**：入站钩子里 `_remember_group()` 把 `stream_id` 和群号记到内存表（`_stream_groups`），`_group_of()` 反查。名单里既能填群号也能填会话 ID，`group_listed()` 会去 `g` 前缀比对。注意这张表是内存态，重载后为空——名单只填群号时，重启后第一条消息进来才会建立映射，别把它当持久化存储。
+
 ## 平台事实（2026-10-22 实测）
 
 | 事实 | 影响 |
@@ -102,6 +106,6 @@ python -m unittest discover -s tests -v
 - 不要在 README / AGENTS / 代码里出现真实 key、代理 IP、群号。
 - 下载远程图片必须先过 `httpclient.is_public_url`：群里构造的图片段能把 URL 指向本机或云元数据地址，别绕开这道校验。
 - 解码前先看像素数（`hashing.MAX_PIXELS`）：小体积不等于小像素，纯色长图能几百 KB 解出上亿像素。
-- 不要提交个人环境的定制值（例如改过的 `command`、`nickname`、代理地址）；仓库只保留默认的「麦麦寻人」与示例配置。
+- 不要提交个人环境的定制值（例如改过的 `command`、`nickname`、代理地址、`db_full_groups` 里的真实群号）；仓库只保留默认的「麦麦寻人」与示例配置。
 - **截图必须脱敏**：群名、昵称、QQ 头像、对方账号、露骨标题都要遮盖或打码；真人裸露照片不要放原图，README 里的效果图优先用虚构字段的示意图（`assets/preview-result.png` 就是脚本生成的）。
 - 提交前扫一遍：`grep -rn "@[A-Za-z0-9_]\{2,\}" README.md AGENTS.md` 与 `grep -rn "127.0.0.1\|OnlyFans" README.md`。
