@@ -1,0 +1,100 @@
+[plugin]
+config_version = "0.3.0"
+enabled = true
+
+# 触发指令。改完不会自动生效：配置热更新不会重新导入模块，
+# 必须在插件管理里手动重载（装饰器的 pattern 在导入时就固定了）。
+command = "麦麦寻人"
+aliases = []
+
+# 指令没带图时，等待用户补发单图的秒数
+image_wait_seconds = 60
+
+# 合并转发里显示的昵称
+nickname = "麦麦寻人"
+
+# 结果保留时间（分钟）。期间回复「<指令> 更多」可以重发完整结果。
+task_ttl_minutes = 15
+
+# 是否展示参考区（除最佳匹配外的其他候选）
+show_reference = true
+reference_limit = 8
+more_limit = 20
+
+# 验证条数：Yandex / 百度各验证前 N 条；Google Lens 返回条数多且最准，
+# 取 2 倍（N=3 时验证 6 条）。SauceNAO 用自带相似度，不下载比对。
+verify_top_n = 3
+
+# 指纹判定阈值：汉明距离 ≤ 该值判为同一张图。越小越严格。
+# 8 是保守值；裁剪版通常会被判到 10~20，会被归入「疑似」。
+hash_threshold = 8
+
+engine_timeout = 35
+download_timeout = 12
+
+# 代理（整个插件只有这一个设置）：所有引擎、候选图下载、AI 检测都走它。
+# 强烈建议填写：Lens（serpapi.com）和 Yandex 在国内直连基本不通，不填代理通常
+# 一个引擎都返回不了结果。例：http://127.0.0.1:6789。
+# 填 direct 表示强制直连（仅在你有其他网络方案时使用）。
+proxy = ""
+
+# 详细日志：默认关闭。遇到问题先在这里改成 true，重载后把日志一起贴到 issues。
+# 开启后会记录取图来源、各引擎返回条数与错误、候选指纹验证结果、最终路线与最佳匹配。
+verbose_log = false
+
+max_concurrent_tasks = 3
+
+[engines]
+# 引擎优先级（调整顺序就是调整优先级）：越靠前越优先采用和展示。
+# 可填 lens、yandex、baidu、saucenao，删掉某个名字即不使用它。
+priority = ["lens", "yandex", "baidu", "saucenao"]
+# 插画路线的引擎优先级：SauceNAO 相似度达到 route_similarity 时自动切到这条顺序
+priority_drawn = ["saucenao", "yandex", "baidu", "lens"]
+
+# ---- 下面四段分别是四个引擎，跟 [ai_detect] 一样各自独立 ----
+
+# Google Lens（SerpAPI）
+# 注册：https://serpapi.com/users/sign_up
+# 免费额度：250 次/月、50 次/小时。keys 里可以填多个 key 轮询。
+# SerpAPI 在国内直连基本不通，必须配好上面的 [plugin] proxy。
+[lens]
+enabled = true
+keys = []
+# 命中精度最高、每次只返回四五条，建议保留 5
+max_results = 5
+
+# Yandex：免费、无 key、返回条数多（一次近百条），但多数是账号主页，噪声大。
+# 国内直连经常超时或被拒，同样依赖上面的 [plugin] proxy。
+[yandex]
+enabled = true
+keys = []
+# 原始结果噪声大，看前 3 条足够
+max_results = 3
+
+# 百度：免费、无 key，主要覆盖 B 站、抖音、微博等国内站点。
+[baidu]
+enabled = true
+keys = []
+max_results = 3
+
+# SauceNAO：自带相似度，适合二次元插画，对真人 coser 命中率一般。
+# 注册：https://saucenao.com/user.php ，key 在 https://saucenao.com/user.php?page=search-api
+# 匿名接口已关闭，不填 key 时该引擎会被跳过（enabled=true 也不启用）。
+[saucenao]
+enabled = true
+keys = []
+min_similarity = 60
+# 相似度达到该值即判定「这张是插画」，切到 priority_drawn；纯像素统计做不到这件事，
+# 用 SauceNAO 是否命中来反推最可靠。
+route_similarity = 75
+# 免费账号单次最多返回 4 条
+max_results = 4
+
+[ai_detect]
+# Sightengine AI 生成图检测，只在「没有可靠匹配」时调用，节省额度。
+# 注册：https://dashboard.sightengine.com/signup
+# 免费额度：2000 ops/月，单次 genai 调用计 5 ops（约 400 次/月）。
+# 密钥格式：api_user:api_secret，例如 "123456:abcdefg..."
+enabled = false
+keys = []
+only_when_low_confidence = true

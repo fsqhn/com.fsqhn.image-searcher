@@ -1,0 +1,9 @@
+/config.toml
+/data/
+__pycache__/
+*.pyc
+*.pyo
+*.upload_tmp
+*.log
+.pytest_cache/
+.venv/

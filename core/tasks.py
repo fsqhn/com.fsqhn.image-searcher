@@ -1,0 +1,231 @@
+"""搜索任务表：Tool 建任务、Command 建任务、追问取结果。
+
+任务按 task_id 索引，同时按 (stream_id, user_id) 记住最近一次，供「更多」直接
+取用，不用重新搜索。主结果留在内存里（含最佳匹配图），落盘只保存文字摘要，
+重启后旧任务仍能回一段文字，但不再带图。
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from .engines import Candidate
+
+
+@dataclass
+class SearchOutcome:
+    """一次搜索的完整结果。"""
+
+    status: str = "ok"  # ok / not_found / error
+    best: Candidate | None = None
+    candidates: list[Candidate] = field(default_factory=list)
+    ai: dict | None = None
+    route: str = "photo"  # photo / drawing
+    route_reason: str = ""
+    errors: dict[str, str] = field(default_factory=dict)
+    engine_counts: dict[str, int] = field(default_factory=dict)
+    elapsed_ms: int = 0
+    total_candidates: int = 0
+    image_b64: str = ""
+    image_source: str = ""
+
+    def to_summary(self) -> dict:
+        """可落盘的摘要（不含图片）。"""
+        return {
+            "status": self.status,
+            "best": asdict(self.best) if self.best else None,
+            "candidates": [asdict(item) for item in self.candidates[:20]],
+            "ai": self.ai,
+            "route": self.route,
+            "route_reason": self.route_reason,
+            "errors": self.errors,
+            "engine_counts": self.engine_counts,
+            "elapsed_ms": self.elapsed_ms,
+            "total_candidates": self.total_candidates,
+            "image_source": self.image_source,
+        }
+
+
+@dataclass
+class SearchTask:
+    task_id: str
+    stream_id: str
+    user_id: str
+    status: str = "running"  # running / done / error
+    created_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    outcome: SearchOutcome | None = None
+    error: str = ""
+
+    @property
+    def elapsed(self) -> float:
+        end = self.finished_at or time.time()
+        return max(0.0, end - self.created_at)
+
+
+class TaskStore:
+    """内存任务表 + 文字摘要落盘。"""
+
+    def __init__(self, data_dir: str | Path, ttl_seconds: float = 900.0) -> None:
+        self._ttl = float(ttl_seconds)
+        self._tasks: dict[str, SearchTask] = {}
+        self._latest: dict[tuple[str, str], str] = {}
+        self._path = Path(data_dir) / "image_searcher_tasks.json"
+
+    # -- 生命周期 ---------------------------------------------------------
+
+    def set_ttl(self, ttl_seconds: float) -> None:
+        self._ttl = max(60.0, float(ttl_seconds))
+
+    def new_task(self, stream_id: str, user_id: str) -> SearchTask:
+        self.cleanup()
+        self._evict()
+        task = SearchTask(
+            task_id=self._make_id(),
+            stream_id=stream_id,
+            user_id=user_id,
+        )
+        self._tasks[task.task_id] = task
+        self._latest[(stream_id, user_id)] = task.task_id
+        return task
+
+    def finish(self, task: SearchTask, outcome: SearchOutcome) -> None:
+        task.outcome = outcome
+        task.status = "done"
+        task.finished_at = time.time()
+        self._persist()
+
+    def fail(self, task: SearchTask, error: str) -> None:
+        task.status = "error"
+        task.error = str(error)[:300]
+        task.finished_at = time.time()
+        self._persist()
+
+    def cleanup(self) -> None:
+        now = time.time()
+        expired = [
+            task_id
+            for task_id, task in self._tasks.items()
+            if now - (task.finished_at or task.created_at) > self._ttl
+        ]
+        for task_id in expired:
+            self._tasks.pop(task_id, None)
+        if expired:
+            alive = {task_id for task_id in self._tasks}
+            self._latest = {key: value for key, value in self._latest.items() if value in alive}
+
+    def _evict(self, keep: int = 50) -> None:
+        """任务里可能持有 1MB+ 的图片 base64，给内存留个硬上限。"""
+        if len(self._tasks) <= keep:
+            return
+        finished = [task for task in self._tasks.values() if task.status != "running"]
+        finished.sort(key=lambda task: task.created_at)
+        for task in finished[: len(self._tasks) - keep]:
+            self._tasks.pop(task.task_id, None)
+        alive = set(self._tasks)
+        self._latest = {key: value for key, value in self._latest.items() if value in alive}
+
+    # -- 查询 -------------------------------------------------------------
+
+    def get(self, task_id: str) -> SearchTask | None:
+        self.cleanup()
+        if not task_id:
+            return None
+        return self._tasks.get(task_id)
+
+    def latest_for(self, stream_id: str, user_id: str) -> SearchTask | None:
+        self.cleanup()
+        task_id = self._latest.get((stream_id, user_id))
+        return self._tasks.get(task_id) if task_id else None
+
+    def latest_in_stream(self, stream_id: str) -> SearchTask | None:
+        self.cleanup()
+        candidates = [
+            task
+            for task in self._tasks.values()
+            if task.stream_id == stream_id and task.status == "done"
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda task: task.finished_at or task.created_at)
+
+    def running_count(self) -> int:
+        return sum(1 for task in self._tasks.values() if task.status == "running")
+
+    # -- 落盘 -------------------------------------------------------------
+
+    def _make_id(self) -> str:
+        stamp = time.strftime("%Y%m%d-%H%M")
+        return f"s-{stamp}-{uuid.uuid4().hex[:4]}"
+
+    def _persist(self) -> None:
+        """只保存最近的文字摘要，图片与二进制不落盘。"""
+        snapshot: dict[str, dict] = {}
+        for task in sorted(self._tasks.values(), key=lambda item: item.created_at, reverse=True)[:30]:
+            if task.status == "running" or task.outcome is None:
+                continue
+            snapshot[task.task_id] = {
+                "stream_id": task.stream_id,
+                "user_id": task.user_id,
+                "created_at": task.created_at,
+                "finished_at": task.finished_at,
+                "summary": task.outcome.to_summary(),
+            }
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001 - 落盘失败不影响主流程
+            pass
+
+    def load(self) -> int:
+        """读回上次的摘要任务，返回恢复条数。"""
+        if not self._path.is_file():
+            return 0
+        try:
+            snapshot = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return 0
+        restored = 0
+        now = time.time()
+        for task_id, payload in snapshot.items():
+            try:
+                created_at = float(payload.get("created_at") or 0)
+                finished_at = float(payload.get("finished_at") or created_at)
+                if now - finished_at > self._ttl:
+                    continue
+                summary = payload.get("summary") or {}
+                outcome = SearchOutcome(
+                    status=str(summary.get("status") or "error"),
+                    best=Candidate(**summary["best"]) if summary.get("best") else None,
+                    candidates=[Candidate(**item) for item in summary.get("candidates") or []],
+                    ai=summary.get("ai"),
+                    route=str(summary.get("route") or "photo"),
+                    route_reason=str(summary.get("route_reason") or ""),
+                    errors=summary.get("errors") or {},
+                    engine_counts=summary.get("engine_counts") or {},
+                    elapsed_ms=int(summary.get("elapsed_ms") or 0),
+                    total_candidates=int(summary.get("total_candidates") or 0),
+                    image_source=str(summary.get("image_source") or ""),
+                )
+                task = SearchTask(
+                    task_id=task_id,
+                    stream_id=str(payload.get("stream_id") or ""),
+                    user_id=str(payload.get("user_id") or ""),
+                    status="done",
+                    created_at=created_at,
+                    finished_at=finished_at,
+                    outcome=outcome,
+                )
+                self._tasks[task_id] = task
+                self._latest[(task.stream_id, task.user_id)] = task_id
+                restored += 1
+            except Exception:  # noqa: BLE001
+                continue
+        return restored
