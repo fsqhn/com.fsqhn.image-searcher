@@ -6,7 +6,10 @@ SerpAPI 和 twimg 在国内直连不通，需要走本地代理；引擎与图�
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -17,9 +20,44 @@ USER_AGENT = (
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
+_BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "metadata", "metadata.google.internal"}
+
 
 class HttpError(RuntimeError):
     """网络请求失败。"""
+
+
+def is_public_url(url: str) -> bool:
+    """只放行指向公网地址的 http(s) 链接。
+
+    图片 URL 有两个来源：聊天消息里的图片段和搜索引擎返回的候选图。前者
+    可以由群成员构造，所以不能直接拿去请求——否则一条伪造的图片段就能让
+    进程带着用户配的代理去访问本机、内网或云厂商的元数据接口。
+    """
+    parsed = urlparse(url or "")
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    host = parsed.hostname.strip().lower().rstrip(".")
+    if host in _BLOCKED_HOSTS or host.endswith(".localhost"):
+        return False
+
+    addresses: list[ipaddress._BaseAddress] = []
+    try:
+        addresses.append(ipaddress.ip_address(host))
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except (socket.gaierror, UnicodeError):
+            return False
+        for info in infos:
+            try:
+                addresses.append(ipaddress.ip_address(info[4][0]))
+            except ValueError:
+                continue
+    if not addresses:
+        return False
+    return all(address.is_global for address in addresses)
+
 
 
 def make_session(proxy: str = "", *, headers: dict[str, str] | None = None) -> requests.Session:
@@ -36,6 +74,8 @@ def download_image(url: str, proxy: str = "", timeout: float = 15.0) -> bytes:
     """下载候选图，返回原始字节；超过大小上限直接放弃。"""
     if not url:
         raise HttpError("图片地址为空")
+    if not is_public_url(url):
+        raise HttpError("图片地址不是公网 http(s)，已拒绝")
     session = make_session(proxy, headers={"Referer": ""})
     try:
         with session.get(url, timeout=timeout, stream=True) as resp:

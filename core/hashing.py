@@ -13,6 +13,14 @@ from PIL import Image, ImageOps
 _HASH_SIDE = 8
 _TARGET_UPLOAD_BYTES = 480 * 1024
 _MIN_SIDE = 320
+# 12MB 的 JPEG 可以解出上亿像素，解码前先按尺寸拦一次，别把内存顶爆。
+MAX_PIXELS = 40_000_000
+
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS
+
+
+def _too_large(image: Image.Image) -> bool:
+    return image.width * image.height > MAX_PIXELS
 
 
 def dhash(raw: bytes, side: int = _HASH_SIDE) -> int | None:
@@ -21,6 +29,8 @@ def dhash(raw: bytes, side: int = _HASH_SIDE) -> int | None:
         return None
     try:
         with Image.open(io.BytesIO(raw)) as image:
+            if _too_large(image):
+                return None
             image = ImageOps.exif_transpose(image)
             gray = image.convert("L").resize((side + 1, side), Image.Resampling.LANCZOS)
             pixels = gray.tobytes()
@@ -48,11 +58,22 @@ def prepare_upload(raw: bytes, limit: int = _TARGET_UPLOAD_BYTES) -> tuple[bytes
     """
     if not raw:
         return raw, "image/jpeg"
+    # 小体积不等于小像素，纯色图能压到几百 KB 却有上亿像素，先读头部拦一次。
+    try:
+        with Image.open(io.BytesIO(raw)) as probe:
+            if _too_large(probe):
+                raise ValueError("图片像素过大")
+    except ValueError:
+        raise
+    except Exception:  # noqa: BLE001 - 解不开的图交给下面的分支按原逻辑处理
+        pass
     if len(raw) <= limit and _sniff_mime(raw) in {"image/jpeg", "image/png", "image/webp"}:
         return raw, _sniff_mime(raw)
 
     try:
         with Image.open(io.BytesIO(raw)) as image:
+            if _too_large(image):
+                raise ValueError("图片像素过大")
             image = ImageOps.exif_transpose(image)
             if image.mode not in ("RGB", "L"):
                 image = image.convert("RGB")
