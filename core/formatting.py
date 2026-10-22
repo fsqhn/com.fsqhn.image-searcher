@@ -92,10 +92,21 @@ def build_forward_nodes(
     nickname: str = "麦麦寻人",
     ttl_minutes: int = 15,
     replay: bool = False,
+    user_id: str = "",
 ) -> list[dict]:
-    """生成合并转发的四个节点；只有最佳匹配节点带图。"""
+    """生成合并转发的四个节点；只有最佳匹配节点带图。
+
+    user_id 会写进转发节点的 uin。QQ 端要求 uin 非空，留空会出现
+    「消息异常」或只剩一个 [聊天记录] 占位，所以调用方要把机器人账号传进来。
+    """
     outcome = task.outcome or SearchOutcome(status="error")
     nodes: list[dict] = []
+
+    def node(content: list[dict]) -> dict:
+        item = {"nickname": nickname, "content": content}
+        if user_id:
+            item["user_id"] = user_id
+        return item
 
     header = "🔍 麦麦寻人结果"
     if outcome.status == "error":
@@ -109,12 +120,12 @@ def build_forward_nodes(
         except (TypeError, ValueError):
             pass
 
-    nodes.append({"nickname": nickname, "content": [{"type": "text", "content": header}]})
+    nodes.append(node([{"type": "text", "content": header}]))
 
     best_content: list[dict] = [{"type": "text", "content": _best_block(outcome)}]
     if outcome.image_b64 and outcome.best is not None:
         best_content.append({"type": "image", "content": outcome.image_b64})
-    nodes.append({"nickname": nickname, "content": best_content})
+    nodes.append(node(best_content))
 
     # 没找到可靠出处时，把参考图挂到参考区，方便用户自己核对是不是同一张。
     ref_image = outcome.image_b64 if outcome.best is None else ""
@@ -128,7 +139,7 @@ def build_forward_nodes(
                 if not reference:
                     ref_content.append({"type": "text", "content": "📋 参考图（未经指纹确认）"})
                 ref_content.append({"type": "image", "content": ref_image})
-            nodes.append({"nickname": nickname, "content": ref_content})
+            nodes.append(node(ref_content))
 
     footer_lines = [_route_line(outcome), _ai_line(outcome.ai)]
     if outcome.image_b64 and outcome.image_source == "upload":
@@ -143,7 +154,7 @@ def build_forward_nodes(
         footer_lines.append("以上为全部参考结果")
     else:
         footer_lines.append(f"{ttl_minutes} 分钟内回复「{command} 更多」可查看全部结果")
-    nodes.append({"nickname": nickname, "content": [{"type": "text", "content": "\n".join(footer_lines)}]})
+    nodes.append(node([{"type": "text", "content": "\n".join(footer_lines)}]))
 
     return nodes
 

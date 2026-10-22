@@ -536,6 +536,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         self._background: set[asyncio.Task] = set()
         self._pending: dict[tuple[str, str], float] = {}
         self._pending_timers: dict[tuple[str, str], asyncio.Task] = {}
+        # 合并转发节点的 uin 不能为空，否则 QQ 端会提示消息异常；从入站消息里记机器人账号。
+        self._self_id: str = ""
         # 消息入库有延迟：指令触发时按 ID 查库往往还是空，所以在入站钩子里先存一份二进制。
         self._image_cache: dict[str, tuple[float, bytes]] = {}
         # 引擎请求与候选图验证分池：引擎是长请求，验证是短下载，
@@ -706,6 +708,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not isinstance(message, dict):
             return True, True, None, None, None
         try:
+            account_id = str(message.get("account_id") or message.get("self_id") or "").strip()
+            if account_id:
+                self._self_id = account_id
             raw = self._remember_image(message)
             # 等待窗口内的补图直接在这里接住：靠指令正则的话，VLM 没出描述时
             # 消息文本是空字符串，压根匹配不上。
@@ -1222,6 +1227,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             nickname=section.nickname,
             ttl_minutes=section.task_ttl_minutes,
             replay=replay,
+            user_id=self._self_id or "0",
         )
         try:
             sent = await self.ctx.send.forward(nodes, task.stream_id)

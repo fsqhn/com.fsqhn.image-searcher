@@ -71,6 +71,13 @@ class ForwardNodesTest(unittest.TestCase):
         )
         self.assertIn("参考图", joined)
 
+    def test_nodes_carry_sender_uin(self) -> None:
+        """uin 为空时 QQ 端会提示消息异常，所以每个节点都要带 user_id。"""
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[], image_b64="", image_source="")
+        nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", user_id="2377510578")
+        self.assertTrue(all(node.get("user_id") == "2377510578" for node in nodes))
+        self.assertGreaterEqual(len(nodes), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
