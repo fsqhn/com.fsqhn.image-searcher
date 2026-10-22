@@ -66,6 +66,7 @@ core/maibot_compat.py  能力返回值解包
 6. **等图窗口要按「会话 + 用户」配对**：群里可能几个人同时在等图，不要只按会话匹配。
 7. **`enabled=false` 要下沉到 `_start_task`**：只挡 Tool 不挡 Command 会漏。
 8. **Tool 与 Command 的 `user_id` 不一致**：查最近任务要 `latest_for` 失败后 `latest_in_stream` 兜底。
+9. **没匹配上不等于不发图**：早前 `_best_image` 与 `build_forward_nodes` 都以 `best is not None` 为前提，`not_found` 时整条转发一张图都没有，用户没法核对。现在 best 为空也会取候选里第一张能下载的图，挂在参考区并注明「未经指纹确认」；候选全失败退回原图。改配图逻辑时这两处要一起看。
 
 ## 排障顺序
 
@@ -74,7 +75,7 @@ core/maibot_compat.py  能力返回值解包
 3. 一直「没看到图片」：看日志有没有「已缓存入站图片」。没有就是钩子没跑到；有缓存还失败，看「按消息 ID 没有取回消息体」。
 4. 结果全是「未验证」：候选图下载失败，检查代理配置与 `download_timeout`；403 属于对端封 IP，无法绕过。
 5. 引擎全失败：看任务文件里 `summary.errors` 的具体 HTTP 状态；Yandex / SerpAPI 先怀疑代理。
-6. 追问「更多」没结果：任务过期（`task_ttl_minutes`）或插件进程重启过（内存任务表重建）。
+6. 追问「更多」没结果：任务过期（`task_ttl_minutes`）或插件进程重启过（内存任务表重建）。「更多」出来的转发没图时，先看原结果状态：`not_found` 早前就是不带图的，现在会给参考区补一张，若仍无图说明候选图全部下载失败，看日志里的「候选图下载失败」。
 
 ## 代理配置
 
@@ -90,10 +91,12 @@ python -m unittest discover -s tests -v
 
 新增引擎适配、改阈值、改指纹逻辑时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
-改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦找鸡已加载：… 上限=…`，且无 traceback。注意改源码会重启插件进程，内存里的任务表会重建。
+改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…`，且无 traceback。注意改源码会重启插件进程，内存里的任务表会重建。改 `command` / `aliases` 同理，必须重载才生效。
 
 ## 发布前检查
 
 - `config.toml` 不要提交；确认仓库里只有 `config.example.toml`。
 - 仓库内不要留 `plugin.py.upload_tmp`、`__pycache__`、日志、任务数据。
 - 不要在 README / AGENTS / 代码里出现真实 key、代理 IP、群号。
+- **截图必须脱敏**：群名、昵称、QQ 头像、对方账号、露骨标题都要遮盖或打码；真人裸露照片不要放原图，README 里的效果图优先用虚构字段的示意图（`assets/preview-result.png` 就是脚本生成的）。
+- 提交前扫一遍：`grep -rn "@[A-Za-z0-9_]\{2,\}" README.md AGENTS.md` 与 `grep -rn "127.0.0.1\|OnlyFans" README.md`。
