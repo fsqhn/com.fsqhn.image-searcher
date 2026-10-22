@@ -116,14 +116,25 @@ def build_forward_nodes(
         best_content.append({"type": "image", "content": outcome.image_b64})
     nodes.append({"nickname": nickname, "content": best_content})
 
-    if show_reference:
+    # 没找到可靠出处时，把参考图挂到参考区，方便用户自己核对是不是同一张。
+    ref_image = outcome.image_b64 if outcome.best is None else ""
+    if show_reference or ref_image:
         reference = _reference_block(outcome, max(1, limit))
-        if reference:
-            nodes.append({"nickname": nickname, "content": [{"type": "text", "content": reference}]})
+        if reference or ref_image:
+            ref_content: list[dict] = []
+            if reference:
+                ref_content.append({"type": "text", "content": reference})
+            if ref_image:
+                if not reference:
+                    ref_content.append({"type": "text", "content": "📋 参考图（未经指纹确认）"})
+                ref_content.append({"type": "image", "content": ref_image})
+            nodes.append({"nickname": nickname, "content": ref_content})
 
     footer_lines = [_route_line(outcome), _ai_line(outcome.ai)]
     if outcome.image_b64 and outcome.image_source == "upload":
         footer_lines.append("（候选图都没取到，转发里的图是你发的原图）")
+    elif outcome.image_b64 and outcome.best is None:
+        footer_lines.append("（参考区那张是相似度最高的候选，未经指纹确认）")
     if outcome.errors:
         failed = "、".join(f"{name}（{message[:40]}）" for name, message in outcome.errors.items())
         footer_lines.append(f"⚠️ 未返回结果的引擎：{failed}")

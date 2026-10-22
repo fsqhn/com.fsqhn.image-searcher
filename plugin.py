@@ -914,16 +914,19 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
     async def _best_image(
         self,
-        best: Candidate,
+        best: Candidate | None,
         ordered: list[Candidate],
         upload: bytes | None,
     ) -> tuple[str, str]:
-        """给最佳匹配配图：多个候选并发下载，按优先级取第一张成功的。
+        """给结果配图：多个候选并发下载，按优先级取第一张成功的。
 
+        best 为空（没找到可靠出处）时照样给一张参考图，方便用户核对是不是同一张；
         候选全失败时退回用户原图；没有原图（比如重放磁盘恢复的任务）就返回空。
         """
         urls: list[str] = []
         for item in [best, *ordered]:
+            if item is None:
+                continue
             if item.image_url and item.image_url not in urls:
                 urls.append(item.image_url)
             if len(urls) >= 4:
@@ -946,7 +949,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
     async def _ensure_image(self, task: SearchTask) -> None:
         """重放或磁盘恢复的任务没有图片时，按候选图地址补一张。"""
         outcome = task.outcome
-        if outcome is None or outcome.image_b64 or outcome.best is None:
+        if outcome is None or outcome.image_b64:
+            return
+        if outcome.best is None and not outcome.candidates:
             return
         image_b64, source = await self._best_image(outcome.best, outcome.candidates, None)
         if image_b64:
@@ -1056,7 +1061,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             total_candidates=total,
         )
 
-        if best is not None:
+        if best is not None or ordered or upload:
             outcome.image_b64, outcome.image_source = await self._best_image(best, ordered, upload)
         return outcome
 
