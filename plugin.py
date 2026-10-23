@@ -316,16 +316,16 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra=_ui("展示其他候选"),
     )
     reference_limit: int = Field(
-        default=8,
-        description="第一次回复里，参考区最多列几条候选。",
-        json_schema_extra=_ui("首次展示候选条数"),
+        default=3,
+        description="第一次回复里，每个引擎最多列几条候选。",
+        json_schema_extra=_ui("首次展示条数（每引擎）", "默认 3。每个引擎单独分组，各列几条。"),
         ge=1,
         le=50,
     )
     more_limit: int = Field(
-        default=20,
-        description="回复「更多」时，参考区最多列几条候选。",
-        json_schema_extra=_ui("「更多」展示条数"),
+        default=10,
+        description="回复「更多」时，每个引擎最多列几条候选（这些候选都会带图）。",
+        json_schema_extra=_ui("「更多」展示条数（每引擎）", "默认 10，基本等于全部结果。"),
         ge=1,
         le=50,
     )
@@ -351,9 +351,9 @@ class PluginSectionConfig(PluginConfigBase):
         le=32,
     )
     engine_timeout: int = Field(
-        default=35,
+        default=50,
         description="单个搜索引擎最多等多少秒，超时就跳过它、继续用其他引擎的结果。",
-        json_schema_extra=_ui("单个引擎超时（秒）", "默认 35。网络差可以调到 50。"),
+        json_schema_extra=_ui("单个引擎超时（秒）", "默认 50。Yandex 走代理容易抖，网络差可以再调到 60。"),
         ge=5,
         le=180,
     )
@@ -1042,6 +1042,64 @@ class ImageSearcherPlugin(MaiBotPlugin):
             outcome.image_b64 = image_b64
             outcome.image_source = source
 
+    _DISPLAY_IMAGE_BYTES = 60 * 1024
+    _DISPLAY_CONCURRENCY = 5
+
+    async def _display_image(self, url: str, semaphore: asyncio.Semaphore) -> str:
+        """下载一张候选图并压成展示用大小，失败返回空串。"""
+        async with semaphore:
+            raw = await self._download(url)
+        if not raw:
+            return ""
+        try:
+            compact, _mime = await asyncio.to_thread(prepare_upload, raw, self._DISPLAY_IMAGE_BYTES)
+        except Exception:  # noqa: BLE001 - 解不开就不附图，不影响文字结果
+            return ""
+        return base64.b64encode(compact).decode("ascii")
+
+    async def _ensure_engine_images(self, task: SearchTask, *, limit: int, whole: bool) -> None:
+        """给参考区的候选配图。
+
+        首次回复只取每个引擎最接近的那张，回「更多」时把展示范围内的候选全配上。
+        展示图压到 100KB 左右，避免合并转发因为体积太大被拒。
+        """
+        outcome = task.outcome
+        if outcome is None or not outcome.candidates:
+            return
+        groups: dict[str, list[Candidate]] = {}
+        for item in outcome.candidates:
+            if item is outcome.best:
+                continue
+            groups.setdefault(item.engine, []).append(item)
+        targets: list[str] = []
+        for items in groups.values():
+            if whole:
+                picked = items[: max(1, limit)]
+            else:
+                first = next((item for item in items if item.image_url), None)
+                picked = [first] if first else []
+            targets.extend(item.image_url for item in picked if item.image_url)
+        pending: list[str] = []
+        for url in targets:
+            if url in outcome.images or url in pending:
+                continue
+            if outcome.best is None and url == outcome.image_source:
+                continue  # 已经作为参考图贴过，不重复
+            pending.append(url)
+        if not pending:
+            return
+        semaphore = asyncio.Semaphore(self._DISPLAY_CONCURRENCY)
+        results = await asyncio.gather(*(self._display_image(url, semaphore) for url in pending))
+        for url, data in zip(pending, results):
+            if data:
+                outcome.images[url] = data
+        self._vlog(
+            "参考区配图：task=%s 目标=%s 成功=%s",
+            task.task_id,
+            len(pending),
+            sum(1 for data in results if data),
+        )
+
     # -- 搜索 -------------------------------------------------------------
 
     def _call_engine(self, name: str, image: bytes, image_url: str, stream_id: str) -> list[Candidate]:
@@ -1297,6 +1355,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if self._tasks is None or not task.stream_id:
             return
         await self._ensure_image(task)
+        await self._ensure_engine_images(task, limit=limit, whole=replay)
         section = self.config.plugin
         nodes = formatting.build_forward_nodes(
             task,
@@ -1311,10 +1370,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
         try:
             sent = await self.ctx.send.forward(nodes, task.stream_id)
             self._vlog(
-                "合并转发已发送：task=%s replay=%s 节点=%s 返回类型=%s",
+                "合并转发已发送：task=%s replay=%s 节点=%s 图=%s 返回类型=%s",
                 task.task_id,
                 replay,
                 len(nodes),
+                sum(1 for item in nodes for part in item.get("content") or [] if part.get("type") == "image"),
                 type(sent).__name__,
             )
             if not _send_ok(sent):

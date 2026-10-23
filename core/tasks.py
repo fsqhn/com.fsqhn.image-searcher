@@ -32,6 +32,8 @@ class SearchOutcome:
     total_candidates: int = 0
     image_b64: str = ""
     image_source: str = ""
+    # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
+    images: dict[str, str] = field(default_factory=dict)
 
     def to_summary(self) -> dict:
         """可落盘的摘要（不含图片）。"""

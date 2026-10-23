@@ -63,24 +63,53 @@ def _best_block(outcome: SearchOutcome) -> str:
     return "\n".join(_identity_lines(best))
 
 
-def _reference_block(
-    outcome: SearchOutcome,
-    limit: int,
-) -> str:
-    best = outcome.best
-    others = [item for item in outcome.candidates if item is not best]
-    if not others:
-        return ""
-    others = others[:limit]
-    lines = ["📋 其他结果"]
-    for index, item in enumerate(others, start=1):
-        tag = f"[{item.platform}]"
-        identity = item.handle or item.name or "（未识别）"
-        status = item.note or "未验证"
-        lines.append(f"{index}. {tag} {identity} · {status}")
-        if item.url:
-            lines.append(f"   {item.url}")
+ENGINE_LABELS = {
+    "lens": "Google Lens",
+    "yandex": "Yandex",
+    "baidu": "百度识图",
+    "saucenao": "SauceNAO",
+}
+
+
+def _engine_name(engine: str) -> str:
+    return ENGINE_LABELS.get(engine, engine or "未知引擎")
+
+
+def _candidate_text(item: Candidate, index: int) -> str:
+    tag = f"[{item.platform}]"
+    identity = item.handle or item.name or "（未识别）"
+    status = item.note or "未验证"
+    lines = [f"{index}. {tag} {identity} · {status}"]
+    if item.url:
+        lines.append(f"   {item.url}")
     return "\n".join(lines)
+
+
+def _engine_groups(
+    outcome: SearchOutcome,
+    best: Candidate | None,
+    limit: int,
+) -> list[tuple[str, list[Candidate]]]:
+    """按引擎把候选分组，组内保持原排序；limit 是每个引擎最多列几条。"""
+    groups: dict[str, list[Candidate]] = {}
+    for item in outcome.candidates:
+        if item is best:
+            continue
+        groups.setdefault(item.engine, []).append(item)
+    return [
+        (engine, items[: max(1, limit)])
+        for engine, items in groups.items()
+        if items
+    ]
+
+
+def _candidate_image(outcome: SearchOutcome, item: Candidate) -> str:
+    """取候选的展示图；已经作为参考图单独贴过的不要重复。"""
+    if not item.image_url:
+        return ""
+    if outcome.best is None and outcome.image_b64 and item.image_url == outcome.image_source:
+        return ""
+    return (outcome.images or {}).get(item.image_url, "")
 
 
 def build_forward_nodes(
@@ -94,8 +123,10 @@ def build_forward_nodes(
     replay: bool = False,
     user_id: str = "",
 ) -> list[dict]:
-    """生成合并转发的四个节点；只有最佳匹配节点带图。
+    """生成合并转发节点：标题、最佳匹配、按引擎分组的参考区、页脚。
 
+    limit 是每个引擎最多列几条。图片由调用方预先塞进 outcome.images
+    （键为候选图地址），首次回复只放每个引擎最接近的那张，回「更多」时放全部。
     user_id 会写进转发节点的 uin。QQ 端要求 uin 非空，留空会出现
     「消息异常」或只剩一个 [聊天记录] 占位，所以调用方要把机器人账号传进来。
     """
@@ -127,19 +158,29 @@ def build_forward_nodes(
         best_content.append({"type": "image", "content": outcome.image_b64})
     nodes.append(node(best_content))
 
-    # 没找到可靠出处时，把参考图挂到参考区，方便用户自己核对是不是同一张。
-    ref_image = outcome.image_b64 if outcome.best is None else ""
-    if show_reference or ref_image:
-        reference = _reference_block(outcome, max(1, limit))
-        if reference or ref_image:
-            ref_content: list[dict] = []
-            if reference:
-                ref_content.append({"type": "text", "content": reference})
-            if ref_image:
-                if not reference:
-                    ref_content.append({"type": "text", "content": "📋 参考图（未经指纹确认）"})
-                ref_content.append({"type": "image", "content": ref_image})
-            nodes.append(node(ref_content))
+    # 没找到可靠出处时，先单独给一张参考图，方便用户自己核对是不是同一张。
+    if outcome.best is None and outcome.image_b64:
+        nodes.append(
+            node(
+                [
+                    {"type": "text", "content": "📋 参考图（未经指纹确认）"},
+                    {"type": "image", "content": outcome.image_b64},
+                ]
+            )
+        )
+
+    # 参考区按引擎分组，每个引擎一个节点，组内候选顺序沿用排序结果。
+    if show_reference:
+        for engine, items in _engine_groups(outcome, outcome.best, limit):
+            content: list[dict] = [
+                {"type": "text", "content": f"▍{_engine_name(engine)}（{len(items)} 条）"}
+            ]
+            for index, item in enumerate(items, start=1):
+                content.append({"type": "text", "content": _candidate_text(item, index)})
+                image = _candidate_image(outcome, item)
+                if image:
+                    content.append({"type": "image", "content": image})
+            nodes.append(node(content))
 
     footer_lines = [_route_line(outcome), _ai_line(outcome.ai)]
     if outcome.image_b64 and outcome.image_source == "upload":
@@ -177,16 +218,17 @@ def build_text_summary(
     if outcome.status != "ok":
         lines.append(f"结论：{outcome.status}")
     if show_reference and outcome.candidates:
-        best = outcome.best
-        others = [item for item in outcome.candidates if item is not best][:limit]
-        if others:
-            lines.append("其他候选：")
-            for index, item in enumerate(others, start=1):
-                identity = item.handle or item.name or "（未识别）"
-                detail = f"{index}. [{item.platform}] {identity} · {item.note or '未验证'}"
-                if item.url:
-                    detail += f" · {item.url}"
-                lines.append(detail)
+        groups = _engine_groups(outcome, outcome.best, limit)
+        if groups:
+            lines.append("其他候选（按引擎分组）：")
+            for engine, items in groups:
+                lines.append(f"[{_engine_name(engine)}]")
+                for index, item in enumerate(items, start=1):
+                    identity = item.handle or item.name or "（未识别）"
+                    detail = f"{index}. [{item.platform}] {identity} · {item.note or '未验证'}"
+                    if item.url:
+                        detail += f" · {item.url}"
+                    lines.append(detail)
     lines.append(_route_line(outcome).replace("🖼 ", ""))
     lines.append(_ai_line(outcome.ai).replace("🤖 ", ""))
     lines.append(f"耗时 {outcome.elapsed_ms / 1000:.1f} 秒，共 {outcome.total_candidates} 条候选。")

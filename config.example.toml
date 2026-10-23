@@ -18,8 +18,10 @@ task_ttl_minutes = 15
 
 # 是否展示参考区（除最佳匹配外的其他候选）
 show_reference = true
-reference_limit = 8
-more_limit = 20
+# 首次回复里每个引擎最多列几条（第一条带图）
+reference_limit = 3
+# 回复「更多」时每个引擎最多列几条（这些候选全部带图）
+more_limit = 10
 
 # 验证条数：Yandex / 百度各验证前 N 条；Google Lens 返回条数多且最准，
 # 取 2 倍（N=3 时验证 6 条）。SauceNAO 用自带相似度，不下载比对。
@@ -29,7 +31,7 @@ verify_top_n = 3
 # 8 是保守值；裁剪版通常会被判到 10~20，会被归入「疑似」。
 hash_threshold = 8
 
-engine_timeout = 35
+engine_timeout = 50
 download_timeout = 12
 
 # 代理（整个插件只有这一个设置）：所有引擎、候选图下载、AI 检测都走它。
