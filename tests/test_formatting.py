@@ -165,6 +165,22 @@ class ForwardNodesTest(unittest.TestCase):
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人")
         self.assertEqual(_images(nodes), [(2, "REF"), (4, "YANDEX1")])
 
+    def test_engine_group_sorted_by_distance(self) -> None:
+        """组内按指纹距离从近到远排，第一条就是该引擎最接近的那张。"""
+        outcome = self._grouped_outcome()
+        lens_one = next(item for item in outcome.candidates if item.url.endswith("/1"))
+        lens_two = next(item for item in outcome.candidates if item.url.endswith("/2"))
+        lens_one.distance, lens_two.distance = 15, 6
+        nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", limit=1)
+        text = "\n".join(
+            part.get("content", "")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn("artworks/2", text)
+        self.assertNotIn("artworks/1", text)
+
     def test_header_follows_configured_command(self) -> None:
         """指令可配置，转发标题也要跟着改，不能写死默认名。"""
         outcome = SearchOutcome(status="ok", best=None, candidates=[], image_b64="")

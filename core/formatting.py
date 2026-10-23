@@ -85,22 +85,32 @@ def _candidate_text(item: Candidate, index: int) -> str:
     return "\n".join(lines)
 
 
-def _engine_groups(
+def engine_groups(
     outcome: SearchOutcome,
     best: Candidate | None,
     limit: int,
 ) -> list[tuple[str, list[Candidate]]]:
-    """按引擎把候选分组，组内保持原排序；limit 是每个引擎最多列几条。"""
+    """按引擎把候选分组，组内按指纹距离从近到远排；limit 是每个引擎最多列几条。
+
+    组内排序按「距离优先、其次相似度」，这样每组第一条就是该引擎最接近的那张，
+    配图时取它，用户看到的也就是最接近的那条。
+    """
     groups: dict[str, list[Candidate]] = {}
     for item in outcome.candidates:
         if item is best:
             continue
         groups.setdefault(item.engine, []).append(item)
-    return [
-        (engine, items[: max(1, limit)])
-        for engine, items in groups.items()
-        if items
-    ]
+    result: list[tuple[str, list[Candidate]]] = []
+    for engine, items in groups.items():
+        ordered = sorted(
+            items,
+            key=lambda item: (
+                item.distance if item.distance is not None else 999,
+                -(item.similarity or 0),
+            ),
+        )
+        result.append((engine, ordered[: max(1, limit)]))
+    return result
 
 
 def _candidate_image(outcome: SearchOutcome, item: Candidate) -> str:
@@ -171,7 +181,7 @@ def build_forward_nodes(
 
     # 参考区按引擎分组，每个引擎一个节点，组内候选顺序沿用排序结果。
     if show_reference:
-        for engine, items in _engine_groups(outcome, outcome.best, limit):
+        for engine, items in engine_groups(outcome, outcome.best, limit):
             content: list[dict] = [
                 {"type": "text", "content": f"▍{_engine_name(engine)}（{len(items)} 条）"}
             ]
@@ -218,7 +228,7 @@ def build_text_summary(
     if outcome.status != "ok":
         lines.append(f"结论：{outcome.status}")
     if show_reference and outcome.candidates:
-        groups = _engine_groups(outcome, outcome.best, limit)
+        groups = engine_groups(outcome, outcome.best, limit)
         if groups:
             lines.append("其他候选（按引擎分组）：")
             for engine, items in groups:

@@ -1066,18 +1066,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
         outcome = task.outcome
         if outcome is None or not outcome.candidates:
             return
-        groups: dict[str, list[Candidate]] = {}
-        for item in outcome.candidates:
-            if item is outcome.best:
-                continue
-            groups.setdefault(item.engine, []).append(item)
         targets: list[str] = []
-        for items in groups.values():
-            if whole:
-                picked = items[: max(1, limit)]
-            else:
-                first = next((item for item in items if item.image_url), None)
-                picked = [first] if first else []
+        for engine, items in formatting.engine_groups(outcome, outcome.best, limit):
+            if not whole and outcome.best is not None and engine == outcome.best.engine:
+                continue  # 首次回复只补其他引擎的图，命中那条所在引擎不重复给
+            picked = items if whole else items[:1]
             targets.extend(item.image_url for item in picked if item.image_url)
         pending: list[str] = []
         for url in targets:
