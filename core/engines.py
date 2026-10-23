@@ -25,7 +25,7 @@ from .extract import (
 )
 from .httpclient import (
     HttpError,
-    download_image,
+    download_image_multi,
     is_auth_failure,
     json_or_raise,
     make_session,
@@ -603,7 +603,7 @@ def verify_candidate(
     from .hashing import dhash, hamming
 
     try:
-        raw = download_image(candidate.image_url, proxy, timeout=timeout)
+        raw = download_image_multi(candidate.image_url, proxy, timeout=timeout)
     except HttpError as exc:
         candidate.status = "unverified"
         candidate.note = f"候选图下载失败：{str(exc)[:60]}"

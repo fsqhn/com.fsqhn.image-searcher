@@ -9,7 +9,7 @@ from unittest import mock
 from PIL import Image
 
 from core.hashing import dhash, prepare_upload
-from core.httpclient import is_public_url
+from core.httpclient import download_routes, is_public_url
 
 
 class PublicUrlTest(unittest.TestCase):
@@ -62,6 +62,32 @@ class PixelGuardTest(unittest.TestCase):
         with mock.patch("core.hashing.MAX_PIXELS", 1000):
             with self.assertRaises(ValueError):
                 prepare_upload(raw)
+
+
+class DownloadRouteTest(unittest.TestCase):
+    """Yandex 图床直连更快，代理反而超时，所以线路顺序要按主机分。"""
+
+    def test_yandex_cdn_prefers_direct(self) -> None:
+        proxy = "http://127.0.0.1:6789"
+        self.assertEqual(
+            download_routes("https://avatars.mds.yandex.net/i?id=1", proxy),
+            ["", proxy],
+        )
+        self.assertEqual(
+            download_routes("https://avatars.mds.yandex.ru/i?id=1", proxy),
+            ["", proxy],
+        )
+
+    def test_other_hosts_prefer_proxy(self) -> None:
+        proxy = "http://127.0.0.1:6789"
+        self.assertEqual(
+            download_routes("https://cdn.donmai.us/a.jpg", proxy),
+            [proxy, ""],
+        )
+
+    def test_without_proxy_only_direct(self) -> None:
+        self.assertEqual(download_routes("https://cdn.donmai.us/a.jpg", ""), [""])
+        self.assertEqual(download_routes("https://avatars.mds.yandex.net/x", ""), [""])
 
 
 if __name__ == "__main__":

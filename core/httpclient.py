@@ -20,6 +20,10 @@ USER_AGENT = (
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
+# 这些图床在国内直连比走代理更快也更稳：实测 avatars.mds.yandex.net 直连约 1 秒，
+# 走代理时常 15 秒以上甚至 SSL 报错，验证阶段会因为超时把结果全标成「未验证」。
+_DIRECT_FIRST_SUFFIXES = ("yandex.net", "yandex.ru", "yandex.com", "yandex.com.tr")
+
 _BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "metadata", "metadata.google.internal"}
 
 
@@ -68,6 +72,33 @@ def make_session(proxy: str = "", *, headers: dict[str, str] | None = None) -> r
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
     return session
+
+
+def download_routes(url: str, proxy: str = "") -> list[str]:
+    """按主机决定先走哪条线路，返回要去重尝试的顺序（"" 表示直连）。"""
+    host = (urlparse(url).hostname or "").lower()
+    direct_first = any(host == suffix or host.endswith("." + suffix) for suffix in _DIRECT_FIRST_SUFFIXES)
+    routes = ["", proxy] if direct_first else [proxy, ""]
+    ordered: list[str] = []
+    for route in routes:
+        if route not in ordered:
+            ordered.append(route)
+    return ordered
+
+
+def download_image_multi(url: str, proxy: str = "", timeout: float = 15.0) -> bytes:
+    """下载图片，失败时换另一条线路再试一次。
+
+    Yandex 图床直连优先（代理反而更慢），其他站点先走代理；两条都不通才报错，
+    错误信息取最后一次的结果。
+    """
+    last_error: HttpError | None = None
+    for route in download_routes(url, proxy):
+        try:
+            return download_image(url, route, timeout)
+        except HttpError as exc:
+            last_error = exc
+    raise last_error or HttpError("图片下载失败")
 
 
 def download_image(url: str, proxy: str = "", timeout: float = 15.0) -> bytes:

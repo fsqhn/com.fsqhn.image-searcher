@@ -74,7 +74,8 @@ core/maibot_compat.py  能力返回值解包
 8. **Tool 与 Command 的 `user_id` 不一致**：查最近任务要 `latest_for` 失败后 `latest_in_stream` 兜底。
 9. **没匹配上不等于不发图**：早前 `_best_image` 与 `build_forward_nodes` 都以 `best is not None` 为前提，`not_found` 时整条转发一张图都没有，用户没法核对。现在 best 为空也会取候选里第一张能下载的图，挂在参考区并注明「未经指纹确认」；候选全失败退回原图。改配图逻辑时这两处要一起看。
 10. **单条合并转发最多放 6 张图**：实测 6 张能过、13 张被 NapCat 以 `send_group_forward_msg` 失败拒掉（错误信息为空，`_send_ok` 判 False）。所以「更多」在图片超过 6 张时按引擎拆成多条，每条带 `1/N` 页码，最佳匹配只在第一批、页脚只在最后一批。别再把十几张图塞进一条转发。
-11. **展示按引擎分组，配图分两档**：`build_forward_nodes` 里一个引擎一个节点，首次回复每个引擎只贴最接近那张（`outcome.images` 里有哪张就贴哪张，键是候选图地址），回「更多」时每个候选都贴图。图由 `_ensure_engine_images` 下载并压到 60KB 左右，别把 1MB 的原图塞进转发，否则转发容易因体积被拒。`outcome.images` 只在内存、不落盘，重放磁盘恢复的任务时靠重新下载补齐。
+11. **候选图下载要分线路**：Yandex 图床 `avatars.mds.yandex.net` 在服务器上直连约 1 秒，走 127.0.0.1:6789 代理常 15 秒以上甚至 SSL 报错，导致验证阶段整批被标「未验证」。`httpclient.download_routes()` 按主机决定顺序（Yandex 系直连优先，其余代理优先），`download_image_multi()` 负责回退。新增引擎时别忘了让它走 multi 版本。
+12. **展示按引擎分组，配图分两档**：`build_forward_nodes` 里一个引擎一个节点，首次回复每个引擎只贴最接近那张（`outcome.images` 里有哪张就贴哪张，键是候选图地址），回「更多」时每个候选都贴图。图由 `_ensure_engine_images` 下载并压到 60KB 左右，别把 1MB 的原图塞进转发，否则转发容易因体积被拒。`outcome.images` 只在内存、不落盘，重放磁盘恢复的任务时靠重新下载补齐。
 
 ## 排障顺序
 

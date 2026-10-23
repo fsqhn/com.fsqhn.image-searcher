@@ -31,7 +31,7 @@ from .core.engines import (
 )
 from .core.extract import is_x_platform
 from .core.hashing import dhash, prepare_upload
-from .core.httpclient import HttpError, download_image
+from .core.httpclient import HttpError, download_image_multi
 from .core.keypool import KeyPool
 from .core.maibot_compat import unwrap_capability
 from .core.tasks import SearchOutcome, SearchTask, TaskStore
@@ -980,21 +980,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return None
 
     async def _download(self, url: str) -> bytes | None:
-        proxy = self._proxy()
-        attempts = [proxy, ""] if proxy else [""]
-        last_error = ""
-        for candidate in attempts:
-            try:
-                return await asyncio.to_thread(
-                    download_image,
-                    url,
-                    candidate,
-                    self.config.plugin.download_timeout,
-                )
-            except HttpError as error:
-                last_error = str(error)
-        self.ctx.logger.info("图片下载失败（代理与直连都试过）：%s → %s", url[:80], last_error)
-        return None
+        try:
+            return await asyncio.to_thread(
+                download_image_multi,
+                url,
+                self._proxy(),
+                self.config.plugin.download_timeout,
+            )
+        except HttpError as error:
+            self.ctx.logger.info("图片下载失败（两条线路都试过）：%s → %s", url[:80], error)
+            return None
 
     async def _best_image(
         self,
