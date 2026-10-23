@@ -370,6 +370,19 @@ class PluginSectionConfig(PluginConfigBase):
         ge=1,
         le=10,
     )
+    deep_more_limit: int = Field(
+        default=20,
+        description=(
+            "深度检索时回复「更多」，每个引擎最多列几条候选。"
+            "深度模式取到的条数比平时多，这个值要跟着放开才看得到全部结果。"
+        ),
+        json_schema_extra=_ui(
+            "深度检索时「更多」条数（每引擎）",
+            "默认 20。开着深度检索却只看到 10 条时，就是这个值没调。",
+        ),
+        ge=1,
+        le=100,
+    )
     deep_verify_top_n: int = Field(
         default=8,
         description="深度检索时每个引擎下载前 N 条候选做指纹比对。这个值直接决定耗时。",
@@ -1303,6 +1316,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 candidate.status = "unverified"
                 candidate.note = f"验证异常：{str(result)[:50]}"
 
+    def _more_limit(self) -> int:
+        """回复「更多」时每个引擎列几条：深度检索取到的多，展示上限也跟着放开。"""
+        section = self.config.plugin
+        return max(1, section.deep_more_limit if section.deep_scan else section.more_limit)
+
     def _eta_text(self) -> str:
         """给用户看的耗时提示。深度检索要明显更久，别按乐观值写死。"""
         return "约 2 分钟" if self.config.plugin.deep_scan else "约 60 秒"
@@ -1719,7 +1737,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         task = self._latest_task(current, user_id)
         if task is None or task.status != "done":
             return False, "", 0  # 没有可重发的任务，交给正常聊天流程
-        await self._send_forward(task, self.config.plugin.more_limit, replay=True)
+        await self._send_forward(task, self._more_limit(), replay=True)
         return True, "已重发上次结果", 2
 
     @Command(
@@ -1771,7 +1789,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     current,
                 )
                 return True, "没有可用的历史结果", 2
-            await self._send_forward(task, self.config.plugin.more_limit, replay=True)
+            await self._send_forward(task, self._more_limit(), replay=True)
             return True, "已重发完整结果", 2
 
         if arg in {"状态", "status"}:

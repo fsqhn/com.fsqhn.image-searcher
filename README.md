@@ -200,6 +200,7 @@ proxy = "http://127.0.0.1:6789"
 | `deep_scan` | false | 深度检索开关：每个引擎按 `deep_scan_limit` 尽量多取结果，命中率更高、耗时约翻倍 |
 | `deep_scan_limit` | 20 | 深度检索时每个引擎最多取几条，调到 60~100 接近全量 |
 | `deep_verify_top_n` | 8 | 深度检索时每个引擎下载前 N 条做指纹比对，直接决定耗时 |
+| `deep_more_limit` | 20 | 深度检索时回复「更多」，每个引擎最多列几条 |
 | `drawing_other_limit` | 3 | 判成插画后，其他引擎每边只留几条参考（且不再下载比对） |
 | `image_wait_seconds` | 60 | 只发指令没带图时，等补图的秒数 |
 | `hash_threshold` | 8 | 汉明距离 ≤ 该值判为同一张图，越小越严格 |
@@ -273,7 +274,7 @@ Yandex 结果的图床在国内直连更快，插件对这类地址会直连优�
 
 默认每次搜索只取各引擎最靠前的几条：`[lens] max_results = 5`、`[yandex] max_results = 3`、`[baidu] max_results = 3`、`[saucenao] max_results = 4`（SauceNAO 免费档单次最多就 4 条），验证阶段再用 `verify_top_n` 挑一部分下载比对。实际引擎返回往往远不止这些——一次搜索拿到一百多条原始结果是常事，所以「取数」本身就是成功率的主要瓶颈。想把某一两个引擎常态取多一点，直接改它那段的 `max_results`。
 
-打开 `deep_scan` 后，每个引擎按 `deep_scan_limit`（默认 20）取满，验证阶段每引擎比对 `deep_verify_top_n`（默认 8）条。代价是耗时：候选翻几倍，下载比对也跟着翻倍，一次搜索通常要多花半分钟到一分钟。
+打开 `deep_scan` 后，每个引擎按 `deep_scan_limit`（默认 20）取满，验证阶段每引擎比对 `deep_verify_top_n`（默认 8）条。回复「更多」时的展示上限也跟着从 `more_limit` 切换到 `deep_more_limit`（默认 20），否则深度取到的结果只能看到前 10 条。代价是耗时：候选翻几倍，下载比对也跟着翻倍，一次搜索通常要多花半分钟到一分钟。
 
 判成插画（SauceNAO 相似度达到 `route_similarity`）时走另一条路：SauceNAO 自带相似度已经能定论，不再逐张下载比对，其他引擎每个只留 `drawing_other_limit`（默认 3）条做参考，并优先把 pixiv 主站的结果当作最佳匹配。
 

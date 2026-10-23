@@ -34,7 +34,7 @@ core/maibot_compat.py  能力返回值解包
 
 **分流在验证之前**：`_sauce_route()` 只看相似度、不需要下载图片，所以在 `_verify()` 之前调用。判成插画后 **不再逐张下载比对**：其他引擎各留 `drawing_other_limit` 条参考、状态保持 `unverified`，最佳匹配从 SauceNAO 的 `match` 里挑，并优先 pixiv 主站（`is_pixiv_platform()`）。照片路线照旧走 `_verify()`。
 
-**取数分两档**：`deep_scan=false` 时每引擎取 `max_results` 条、验证 `verify_top_n`（Lens 2N）；`deep_scan=true` 时每引擎取到 `deep_scan_limit`、验证 `deep_verify_top_n`。改取数只动这一处，别在引擎里另加截断。
+**取数分两档**：`deep_scan=false` 时每引擎取 `max_results` 条、验证 `verify_top_n`（Lens 2N）、「更多」展示 `more_limit`；`deep_scan=true` 时每引擎取到 `deep_scan_limit`、验证 `deep_verify_top_n`、「更多」展示 `deep_more_limit`。改取数只动这一处，别在引擎里另加截断。
 
 **配置热更新有限**：`self.config` 会热更新，但 `@Command` 的 `pattern` 是模块导入时生成的。改 `command` / `aliases` 必须重载插件。
 

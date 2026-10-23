@@ -32,6 +32,9 @@ verify_top_n = 3
 deep_scan = false
 deep_scan_limit = 20
 deep_verify_top_n = 8
+# 深度检索时回复「更多」，每个引擎最多列几条。深度取到的比平时多，
+# 这里不放开的话，只能在结果里看到 more_limit 那几条。
+deep_more_limit = 20
 
 # SauceNAO 判定为插画后，其他引擎每个只留这么多条做参考，且不再下载图片比对。
 drawing_other_limit = 3
