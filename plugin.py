@@ -1344,12 +1344,102 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if notify and task.stream_id:
                 await self.ctx.send.text(f"搜图失败：{error}", task.stream_id)
 
+    # QQ 单条合并转发的图片总量有上限，超过后 send_group_forward_msg 会被对端拒绝。
+    # 实测 6 张图能过、13 张失败，所以「更多」按这个预算拆成几条发。
+    _MAX_FORWARD_IMAGES = 6
+
+    @staticmethod
+    def _planned_images(outcome: SearchOutcome, groups: list[tuple[str, list[Candidate]]]) -> int:
+        total = 1 if outcome.image_b64 else 0
+        for _engine, items in groups:
+            total += sum(1 for item in items if formatting.candidate_image(outcome, item))
+        return total
+
+    async def _send_engine_forwards(
+        self,
+        task: SearchTask,
+        groups: list[tuple[str, list[Candidate]]],
+        section: Any,
+    ) -> None:
+        """图太多时按引擎拆成几条合并转发，每条不超过 6 张图。"""
+        outcome = task.outcome
+        if outcome is None:
+            return
+        batches: list[tuple[str, list[Candidate]]] = []
+        for engine, items in groups:
+            chunk: list[Candidate] = []
+            used = 0
+            for item in items:
+                cost = 1 if formatting.candidate_image(outcome, item) else 0
+                if chunk and used + cost > self._MAX_FORWARD_IMAGES:
+                    batches.append((engine, chunk))
+                    chunk, used = [], 0
+                chunk.append(item)
+                used += cost
+            if chunk:
+                batches.append((engine, chunk))
+        if not batches:
+            return
+
+        total = len(batches)
+        delivered = 0
+        for index, (engine, items) in enumerate(batches, start=1):
+            nodes = formatting.build_engine_forward_nodes(
+                task,
+                engine,
+                items,
+                command=COMMAND,
+                nickname=section.nickname,
+                ttl_minutes=section.task_ttl_minutes,
+                user_id=self._self_id or "0",
+                part=(index, total),
+                with_best=(index == 1),
+                include_footer=(index == total),
+            )
+            try:
+                sent = await self.ctx.send.forward(nodes, task.stream_id)
+            except Exception as error:  # noqa: BLE001 - 单批失败不影响后续批次
+                self.ctx.logger.warning("分条转发异常：批次=%s/%s 引擎=%s err=%s", index, total, engine, error)
+                continue
+            self._vlog(
+                "分条合并转发：task=%s 批次=%s/%s 引擎=%s 候选=%s 图=%s 返回类型=%s 成功=%s",
+                task.task_id,
+                index,
+                total,
+                engine,
+                len(items),
+                sum(1 for item in nodes for part in item.get("content") or [] if part.get("type") == "image"),
+                type(sent).__name__,
+                _send_ok(sent),
+            )
+            if _send_ok(sent):
+                delivered += 1
+            else:
+                self.ctx.logger.warning("分条转发被拒绝：批次=%s/%s 引擎=%s", index, total, engine)
+            await asyncio.sleep(1)
+        if delivered == 0:
+            text = formatting.build_text_summary(
+                task,
+                command=COMMAND,
+                show_reference=section.show_reference,
+                limit=self.config.plugin.reference_limit,
+            )
+            fallback = await self.ctx.send.text(text, task.stream_id)
+            if not _send_ok(fallback):
+                self.ctx.logger.warning("分条转发全部失败，文字退路也失败：task=%s", task.task_id)
+
     async def _send_forward(self, task: SearchTask, limit: int, *, replay: bool = False) -> None:
         if self._tasks is None or not task.stream_id:
             return
         await self._ensure_image(task)
         await self._ensure_engine_images(task, limit=limit, whole=replay)
         section = self.config.plugin
+        outcome = task.outcome
+        if replay and outcome is not None:
+            groups = formatting.engine_groups(outcome, outcome.best, limit)
+            if len(groups) > 1 and self._planned_images(outcome, groups) > self._MAX_FORWARD_IMAGES:
+                await self._send_engine_forwards(task, groups, section)
+                return
         nodes = formatting.build_forward_nodes(
             task,
             command=COMMAND,

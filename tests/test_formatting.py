@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from core.engines import Candidate
-from core.formatting import build_forward_nodes
+from core.formatting import build_engine_forward_nodes, build_forward_nodes, engine_groups
 from core.tasks import SearchOutcome, SearchTask
 
 
@@ -180,6 +180,42 @@ class ForwardNodesTest(unittest.TestCase):
         )
         self.assertIn("artworks/2", text)
         self.assertNotIn("artworks/1", text)
+
+    def test_engine_forward_carries_best_only_on_first_batch(self) -> None:
+        """图多时按引擎拆成多条，最佳匹配只在第一条出现，页脚只在最后一条。"""
+        outcome = self._grouped_outcome()
+        outcome.images = {
+            "https://img.example/1.jpg": "LENS1",
+            "https://img.example/2.jpg": "LENS2",
+            "https://img.example/3.jpg": "YANDEX1",
+        }
+        groups = engine_groups(outcome, outcome.best, 10)
+        self.assertTrue(groups)
+        engine, items = groups[0]
+        first = build_engine_forward_nodes(
+            _task(outcome), engine, items, command="麦麦寻人", part=(1, 2), with_best=True
+        )
+        last = build_engine_forward_nodes(
+            _task(outcome), groups[-1][0], groups[-1][1], command="麦麦寻人", part=(2, 2), include_footer=True
+        )
+        first_text = "\n".join(
+            part.get("content", "")
+            for node in first
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        last_text = "\n".join(
+            part.get("content", "")
+            for node in last
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn("1/2", first_text)
+        self.assertIn("平台", first_text)  # 最佳匹配块在第一批
+        self.assertIn("以上为全部参考结果", last_text)
+        self.assertNotIn("平台", last_text)
+        # 第一批的图只来自本批候选（含最佳匹配那张），不重复
+        self.assertEqual(_images(first)[0], (1, "BEST"))
 
     def test_header_follows_configured_command(self) -> None:
         """指令可配置，转发标题也要跟着改，不能写死默认名。"""

@@ -113,13 +113,45 @@ def engine_groups(
     return result
 
 
-def _candidate_image(outcome: SearchOutcome, item: Candidate) -> str:
+def candidate_image(outcome: SearchOutcome, item: Candidate) -> str:
     """取候选的展示图；已经作为参考图单独贴过的不要重复。"""
     if not item.image_url:
         return ""
     if outcome.best is None and outcome.image_b64 and item.image_url == outcome.image_source:
         return ""
     return (outcome.images or {}).get(item.image_url, "")
+
+
+def _header_text(outcome: SearchOutcome, command: str, replay: bool) -> str:
+    header = f"🔍 {command}结果"
+    if outcome.status == "error":
+        header = f"🔍 {command} · 搜索失败"
+    if replay:
+        header = f"🔍 {command}结果 · 全部候选"
+    if outcome.ai and outcome.ai.get("ok"):
+        try:
+            if float(outcome.ai.get("score") or 0) >= AI_FLAG_THRESHOLD:
+                header = f"🔍 {command} · 疑似 AI 生成"
+        except (TypeError, ValueError):
+            pass
+    return header
+
+
+def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool) -> list[str]:
+    lines = [_route_line(outcome), _ai_line(outcome.ai)]
+    if outcome.image_b64 and outcome.image_source == "upload":
+        lines.append("（候选图都没取到，转发里的图是你发的原图）")
+    elif outcome.image_b64 and outcome.best is None:
+        lines.append("（参考区那张是相似度最高的候选，未经指纹确认）")
+    if outcome.errors:
+        failed = "、".join(f"{name}（{message[:40]}）" for name, message in outcome.errors.items())
+        lines.append(f"⚠️ 未返回结果的引擎：{failed}")
+    lines.append("")
+    if replay:
+        lines.append("以上为全部参考结果")
+    else:
+        lines.append(f"{ttl_minutes} 分钟内回复「{command} 更多」可查看全部结果")
+    return lines
 
 
 def build_forward_nodes(
@@ -149,19 +181,7 @@ def build_forward_nodes(
             item["user_id"] = user_id
         return item
 
-    header = f"🔍 {command}结果"
-    if outcome.status == "error":
-        header = f"🔍 {command} · 搜索失败"
-    if replay:
-        header = f"🔍 {command}结果 · 全部候选"
-    if outcome.ai and outcome.ai.get("ok"):
-        try:
-            if float(outcome.ai.get("score") or 0) >= AI_FLAG_THRESHOLD:
-                header = f"🔍 {command} · 疑似 AI 生成"
-        except (TypeError, ValueError):
-            pass
-
-    nodes.append(node([{"type": "text", "content": header}]))
+    nodes.append(node([{"type": "text", "content": _header_text(outcome, command, replay)}]))
 
     best_content: list[dict] = [{"type": "text", "content": _best_block(outcome)}]
     if outcome.image_b64 and outcome.best is not None:
@@ -187,26 +207,66 @@ def build_forward_nodes(
             ]
             for index, item in enumerate(items, start=1):
                 content.append({"type": "text", "content": _candidate_text(item, index)})
-                image = _candidate_image(outcome, item)
+                image = candidate_image(outcome, item)
                 if image:
                     content.append({"type": "image", "content": image})
             nodes.append(node(content))
 
-    footer_lines = [_route_line(outcome), _ai_line(outcome.ai)]
-    if outcome.image_b64 and outcome.image_source == "upload":
-        footer_lines.append("（候选图都没取到，转发里的图是你发的原图）")
-    elif outcome.image_b64 and outcome.best is None:
-        footer_lines.append("（参考区那张是相似度最高的候选，未经指纹确认）")
-    if outcome.errors:
-        failed = "、".join(f"{name}（{message[:40]}）" for name, message in outcome.errors.items())
-        footer_lines.append(f"⚠️ 未返回结果的引擎：{failed}")
-    footer_lines.append("")
-    if replay:
-        footer_lines.append("以上为全部参考结果")
-    else:
-        footer_lines.append(f"{ttl_minutes} 分钟内回复「{command} 更多」可查看全部结果")
-    nodes.append(node([{"type": "text", "content": "\n".join(footer_lines)}]))
+    nodes.append(node([{"type": "text", "content": "\n".join(_footer_lines(outcome, command, ttl_minutes, replay))}]))
 
+    return nodes
+
+
+def build_engine_forward_nodes(
+    task: SearchTask,
+    engine: str,
+    items: list[Candidate],
+    *,
+    command: str,
+    nickname: str = "麦麦寻人",
+    ttl_minutes: int = 15,
+    user_id: str = "",
+    part: tuple[int, int] | None = None,
+    with_best: bool = False,
+    include_footer: bool = False,
+) -> list[dict]:
+    """把一个引擎的一批候选单独打成一条合并转发。
+
+    QQ 对单条合并转发的图片总量有限制，图一多（十几张）组装就会失败，
+    所以「更多」按引擎拆成几条发，每条只有该引擎的候选、图片随候选走。
+    """
+    outcome = task.outcome or SearchOutcome(status="error")
+    nodes: list[dict] = []
+
+    def node(content: list[dict]) -> dict:
+        entry = {"nickname": nickname, "content": content}
+        if user_id:
+            entry["user_id"] = user_id
+        return entry
+
+    label = f"▍{_engine_name(engine)}（{len(items)} 条）"
+    if part:
+        label += f" · {part[0]}/{part[1]}"
+    header = f"{_header_text(outcome, command, True)} · {label}"
+    nodes.append(node([{"type": "text", "content": header}]))
+
+    if with_best:
+        best_content: list[dict] = [{"type": "text", "content": _best_block(outcome)}]
+        if outcome.image_b64 and outcome.best is not None:
+            best_content.append({"type": "image", "content": outcome.image_b64})
+        nodes.append(node(best_content))
+
+    for index, item in enumerate(items, start=1):
+        content: list[dict] = [{"type": "text", "content": _candidate_text(item, index)}]
+        image = candidate_image(outcome, item)
+        if image:
+            content.append({"type": "image", "content": image})
+        nodes.append(node(content))
+
+    if include_footer:
+        nodes.append(
+            node([{"type": "text", "content": "\n".join(_footer_lines(outcome, command, ttl_minutes, True))}])
+        )
     return nodes
 
 
