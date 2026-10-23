@@ -29,7 +29,7 @@ from .core.engines import (
     detect_ai,
     verify_candidate,
 )
-from .core.extract import is_x_platform
+from .core.extract import is_pixiv_platform, is_x_platform
 from .core.hashing import dhash, prepare_upload
 from .core.httpclient import HttpError, download_image_multi
 from .core.keypool import KeyPool
@@ -335,6 +335,50 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra=_ui("每个引擎验证几条", "默认 3。调大更不容易漏，但会多下载几张图。"),
         ge=1,
         le=10,
+    )
+    deep_scan: bool = Field(
+        default=False,
+        description=(
+            "深度检索：每个引擎不只取前几条，而是按下面的上限尽量多取，并加大指纹比对数量。"
+            "能提高找出来的概率，但一次搜索会明显变慢。"
+        ),
+        json_schema_extra=_ui(
+            "深度检索（取更多结果）",
+            "打开后每个引擎按「深度检索时每引擎上限」取数，找出来的概率更高，代价是慢一倍左右。",
+        ),
+    )
+    deep_scan_limit: int = Field(
+        default=20,
+        description="深度检索时每个引擎最多取多少条候选。设大接近全量。",
+        json_schema_extra=_ui(
+            "深度检索时每引擎上限",
+            "默认 20。想接近全量可以调到 60~100，但耗时和流量会跟着涨。SauceNAO 免费档每次最多 4 条，不受这个值影响。",
+        ),
+        ge=5,
+        le=100,
+    )
+    drawing_other_limit: int = Field(
+        default=3,
+        description=(
+            "SauceNAO 判定为插画后，其他引擎每边只留几条做参考，不再下载图片比对。"
+            "插画库命中已经足够确定，没必要再逐张验证。"
+        ),
+        json_schema_extra=_ui(
+            "插画路线每引擎留几条",
+            "默认 3。判成插画后其他引擎只留这么多条参考，不下载图，速度快很多。",
+        ),
+        ge=1,
+        le=10,
+    )
+    deep_verify_top_n: int = Field(
+        default=8,
+        description="深度检索时每个引擎下载前 N 条候选做指纹比对。这个值直接决定耗时。",
+        json_schema_extra=_ui(
+            "深度检索时每引擎验证几条",
+            "默认 8。调大更容易找出漏掉的结果，但每多一条就多下载一张图。",
+        ),
+        ge=1,
+        le=30,
     )
     image_wait_seconds: int = Field(
         default=60,
@@ -843,7 +887,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"启动搜图失败：{error}", current)
             return
         self.ctx.logger.info("等待窗口内收到图片，开始搜图：stream=%s user=%s", current, user_id)
-        await self.ctx.send.text("🔍 收到图片，开始搜图，约 40 秒。", current)
+        await self.ctx.send.text(f"🔍 收到图片，开始搜图，{self._eta_text()}。", current)
 
     def _remember_image(self, message: dict) -> bytes | None:
         message_id = str(message.get("message_id") or "").strip()
@@ -1121,12 +1165,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
         grouped: dict[str, list[Candidate]] = {}
         errors: dict[str, str] = {}
         engine_counts: dict[str, int] = {}
+        # 深度检索：每个引擎按 deep_scan_limit 取数（不超过引擎实际返回），换更高的命中概率。
+        deep = bool(section.deep_scan)
+        deep_cap = max(1, int(section.deep_scan_limit))
         for name, outcome in zip(names, settled):
             if isinstance(outcome, BaseException):
                 errors[name] = f"{type(outcome).__name__}: {str(outcome)[:120]}"
                 continue
             engine_counts[name] = len(outcome)
             limit = max(1, int(getattr(config, name).max_results))
+            if deep:
+                limit = max(limit, deep_cap)
             grouped[name] = outcome[:limit]
 
         candidates: list[Candidate] = []
@@ -1134,25 +1183,42 @@ class ImageSearcherPlugin(MaiBotPlugin):
             candidates.extend(grouped.get(name, []))
         total = len(candidates)
         self._vlog(
-            "引擎返回：%s；错误：%s；原始候选=%s",
+            "引擎返回：%s；错误：%s；原始候选=%s；深度检索=%s",
             {name: engine_counts.get(name, 0) for name in names},
             errors or "无",
             total,
+            "开" if deep else "关",
         )
 
-        await self._verify(candidates, grouped, names, target_hash)
-
         # 结果驱动分流：SauceNAO 索引的是插画站点，真人照片基本没有高相似度命中。
-        # 命中就说明这张更像绘制图，按插画优先级重排；否则维持照片优先级。
+        # 这一步只看相似度、不需要下载图片，所以放在验证之前。
         sauce = self._sauce_route(candidates)
         route = "drawing" if sauce else "photo"
         route_reason = f"SauceNAO 相似度 {sauce.similarity:g}%" if sauce else "无插画库命中"
         if sauce:
             names = _dedupe([name for name in config.engines.priority_drawn if name in names] + names)
+            # 插画路线：SauceNAO 自带相似度已经能定论，再逐张下载比对没有意义。
+            # 其他引擎只留几条意思一下，全部不做下载验证。
+            other_limit = max(1, int(section.drawing_other_limit))
+            for name in names:
+                if name == "saucenao":
+                    continue
+                if name not in grouped:
+                    continue
+                grouped[name] = grouped[name][:other_limit]
+                # 这些候选没下载比对过，状态和备注都要如实改写，
+                # 否则会把引擎自带的「精确匹配」标签和账号原样发出去。
+                for item in grouped[name]:
+                    item.status = "unverified"
+                    item.note = "插画路线参考，未做指纹比对"
+            candidates = [item for name in names for item in grouped.get(name, [])]
+        else:
+            await self._verify(candidates, grouped, names, target_hash)
 
-        ordered = self._rank(candidates, names)
+        ordered = self._rank(candidates, names, prefer_pixiv=sauce is not None)
         # 最佳匹配按指纹质量挑，不受引擎顺序影响；指纹距离优先，其次相似度。
-        best = self._pick_best(ordered)
+        # 插画路线优先取 pixiv 的命中。
+        best = self._pick_best(ordered, prefer_pixiv=sauce is not None)
         self._vlog(
             "分流结果：路线=%s 原因=%s；匹配=%s 疑似=%s 不符=%s 未验证=%s",
             route,
@@ -1203,6 +1269,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         target_hash: int | None,
     ) -> None:
         section = self.config.plugin
+        deep = bool(section.deep_scan)
         targets: list[Candidate] = []
         for name in names:
             if name == "saucenao":
@@ -1210,7 +1277,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
             items = grouped.get(name) or []
             # Lens 会把 visual_matches 与 exact_matches 一起返回，条数可能几十条，
             # 全量下载验证太慢；取 2 倍配置条数，足够覆盖最相关的前几条。
-            limit = max(1, section.verify_top_n) * 2 if name == "lens" else max(1, section.verify_top_n)
+            normal = max(1, section.verify_top_n) * 2 if name == "lens" else max(1, section.verify_top_n)
+            limit = max(1, int(section.deep_verify_top_n), normal) if deep else normal
             targets.extend(items[:limit])
         if not targets:
             return
@@ -1235,13 +1303,19 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 candidate.status = "unverified"
                 candidate.note = f"验证异常：{str(result)[:50]}"
 
+    def _eta_text(self) -> str:
+        """给用户看的耗时提示。深度检索要明显更久，别按乐观值写死。"""
+        return "约 2 分钟" if self.config.plugin.deep_scan else "约 60 秒"
+
     def _sauce_route(self, candidates: list[Candidate]) -> Candidate | None:
         """SauceNAO 高相似度命中即认为这张是插画。"""
         if not self._enabled("saucenao"):
             return None
         threshold = self.config.saucenao.route_similarity
         for item in candidates:
-            if item.engine == "saucenao" and (item.similarity or 0) >= threshold:
+            if item.engine != "saucenao" or item.status != "match":
+                continue
+            if (item.similarity or 0) >= threshold:
                 return item
         return None
 
@@ -1251,10 +1325,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return is_x_platform(item.platform)
 
     @staticmethod
-    def _pick_best(ordered: list[Candidate]) -> Candidate | None:
+    def _pick_best(ordered: list[Candidate], prefer_pixiv: bool = False) -> Candidate | None:
         matches = [item for item in ordered if item.status == "match"]
         if not matches:
             return None
+        if prefer_pixiv:
+            # 插画路线：SauceNAO 常同时给出转载站和 pixiv 原图，优先当作画师原帖。
+            # 但只在相似度接近时才让 pixiv 插队，避免低分 pixiv 命中盖掉高分结果。
+            best_score = max(item.similarity or 0 for item in matches)
+            pixiv = [
+                item
+                for item in matches
+                if is_pixiv_platform(item.platform, item.url) and (item.similarity or 0) >= best_score - 5
+            ]
+            if pixiv:
+                matches = pixiv
         hashed = [item for item in matches if item.distance is not None]
         if hashed:
             return min(
@@ -1266,17 +1351,24 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
         return max(matches, key=lambda item: item.similarity or 0)
 
-    def _rank(self, candidates: list[Candidate], names: list[str]) -> list[Candidate]:
+    def _rank(
+        self,
+        candidates: list[Candidate],
+        names: list[str],
+        prefer_pixiv: bool = False,
+    ) -> list[Candidate]:
         order = {name: index for index, name in enumerate(names)}
         status_weight = {"match": 0, "suspect": 1, "unverified": 2, "mismatch": 3, "error": 4}
 
         def key(item: Candidate) -> tuple:
             distance = item.distance if item.distance is not None else 999
             similarity = -(item.similarity if item.similarity is not None else 0)
+            pixiv_first = 0 if prefer_pixiv and is_pixiv_platform(item.platform, item.url) else 1
             # 引擎顺序放在质量之前：优先级就是展示顺序，照片 Lens 先、插画 SauceNAO 先。
             # X / Twitter 只在指纹距离完全相同时插队，不会盖过更接近的图。
             return (
                 status_weight.get(item.status, 2),
+                pixiv_first,
                 order.get(item.engine, 99),
                 item.rank,
                 distance,
@@ -1418,6 +1510,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 command=COMMAND,
                 show_reference=section.show_reference,
                 limit=self.config.plugin.reference_limit,
+                eta_text=self._eta_text(),
             )
             fallback = await self.ctx.send.text(text, task.stream_id)
             if not _send_ok(fallback):
@@ -1464,6 +1557,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 command=COMMAND,
                 show_reference=section.show_reference,
                 limit=limit,
+                eta_text=self._eta_text(),
             )
             fallback = await self.ctx.send.text(text, task.stream_id)
             if not _send_ok(fallback):
@@ -1516,8 +1610,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         brief_description="用户发来图片、想查这张图的原始出处或作者社交账号时使用。",
         detailed_description=(
             "从当前聊天里取最近一张图片（或用户引用的图片），反查它的原始出处与账号。"
-            "搜索需要 30~60 秒，因此本工具立即返回 task_id，不等待结果。"
-            "返回后请告诉用户「正在搜索，约 40 秒」，稍后再调用 search_status 取结果。"
+            "搜索通常要 1 分钟上下（开了深度检索更久），因此本工具立即返回 task_id，不等待结果。"
+            "返回后请告诉用户「正在搜索，约 1 分钟」，稍后再调用 search_status 取结果。"
             "本工具只返回文字摘要，不会发图片。"
         ),
         parameters=[
@@ -1544,7 +1638,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return {"success": False, "content": f"启动搜图失败：{error}", "message": str(error)}
 
         message = (
-            f"已开始搜索（task_id={task.task_id}，图片来源：{source}），预计 40 秒左右。"
+            f"已开始搜索（task_id={task.task_id}，图片来源：{source}），预计 {self._eta_text()}。"
             f"结果会以合并转发发到聊天里；也可以用 search_status 凭 task_id 取文字摘要。"
         )
         self.ctx.logger.info("Tool 启动搜图：task=%s user=%s note=%s", task.task_id, user_id, note)
@@ -1592,6 +1686,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             command=COMMAND,
             show_reference=section.show_reference,
             limit=section.reference_limit,
+            eta_text=self._eta_text(),
         )
         return {
             "success": task.status == "done",
@@ -1657,7 +1752,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"启动搜图失败：{error}", current)
             return False, str(error), 1
 
-        await self.ctx.send.text("🔍 收到图片，开始搜图，约 40 秒。", current)
+        await self.ctx.send.text(f"🔍 收到图片，开始搜图，{self._eta_text()}。", current)
         return True, "搜图中", 2
 
     async def _handle_command(self, stream_id: str, kwargs: dict) -> tuple[bool, str, int]:
@@ -1708,7 +1803,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return False, str(error), 1
 
         await self.ctx.send.text(
-            f"🔍 正在搜图（{source}），约 40 秒，结果稍后以合并转发发出。",
+            f"🔍 正在搜图（{source}），{self._eta_text()}，结果稍后以合并转发发出。",
             current,
         )
         return True, "搜图中", 2

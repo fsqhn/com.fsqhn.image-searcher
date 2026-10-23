@@ -5,7 +5,12 @@ from __future__ import annotations
 import unittest
 
 from core.engines import Candidate
-from core.formatting import build_engine_forward_nodes, build_forward_nodes, engine_groups
+from core.formatting import (
+    build_engine_forward_nodes,
+    build_forward_nodes,
+    build_text_summary,
+    engine_groups,
+)
 from core.tasks import SearchOutcome, SearchTask
 
 
@@ -230,6 +235,38 @@ class ForwardNodesTest(unittest.TestCase):
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", user_id="2377510578")
         self.assertTrue(all(node.get("user_id") == "2377510578" for node in nodes))
         self.assertGreaterEqual(len(nodes), 3)
+
+
+class CandidateAccountTest(unittest.TestCase):
+    def test_unverified_candidate_hides_account(self) -> None:
+        item = Candidate(
+            engine="lens",
+            url="https://x.com/someone",
+            handle="@someone",
+            name="Someone",
+            status="unverified",
+            note="插画路线参考，未做指纹比对",
+        )
+        item.finalize()
+        outcome = SearchOutcome(status="ok", best=None, candidates=[item])
+        text = build_text_summary(_task(outcome), command="麦麦寻人")
+        self.assertIn("账号未确认", text)
+        self.assertNotIn("@someone", text)
+
+    def test_matched_candidate_keeps_account(self) -> None:
+        item = Candidate(engine="lens", url="https://x.com/someone", handle="@someone", distance=4, status="match")
+        item.finalize()
+        outcome = SearchOutcome(status="ok", best=item, candidates=[item])
+        text = build_text_summary(_task(outcome), command="麦麦寻人")
+        self.assertIn("@someone", text)
+
+
+class EtaTextTest(unittest.TestCase):
+    def test_running_task_uses_given_eta(self) -> None:
+        task = SearchTask(task_id="s-test", stream_id="g1", user_id="u1", status="running")
+        text = build_text_summary(task, command="麦麦寻人", eta_text="约 2 分钟")
+        self.assertIn("约 2 分钟", text)
+        self.assertNotIn("40 秒", text)
 
 
 if __name__ == "__main__":

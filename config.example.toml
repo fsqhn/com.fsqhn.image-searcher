@@ -27,6 +27,15 @@ more_limit = 10
 # 取 2 倍（N=3 时验证 6 条）。SauceNAO 用自带相似度，不下载比对。
 verify_top_n = 3
 
+# 深度检索：打开后每个引擎不只取前几条，而是按 deep_scan_limit 尽量多取，
+# 并在验证阶段按 deep_verify_top_n 多比对几张。命中率更高，耗时大约翻倍。
+deep_scan = false
+deep_scan_limit = 20
+deep_verify_top_n = 8
+
+# SauceNAO 判定为插画后，其他引擎每个只留这么多条做参考，且不再下载图片比对。
+drawing_other_limit = 3
+
 # 指纹判定阈值：汉明距离 ≤ 该值判为同一张图。越小越严格。
 # 8 是保守值；裁剪版通常会被判到 10~20，会被归入「疑似」。
 hash_threshold = 8

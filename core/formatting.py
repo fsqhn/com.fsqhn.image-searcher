@@ -75,9 +75,16 @@ def _engine_name(engine: str) -> str:
     return ENGINE_LABELS.get(engine, engine or "未知引擎")
 
 
+def _candidate_identity(item: Candidate) -> str:
+    """没下载比对过、或指纹明确不符的候选，账号并不是原作者，不能当结论发出去。"""
+    if item.status in {"unverified", "mismatch"}:
+        return "（账号未确认）"
+    return item.handle or item.name or "（未识别）"
+
+
 def _candidate_text(item: Candidate, index: int) -> str:
     tag = f"[{item.platform}]"
-    identity = item.handle or item.name or "（未识别）"
+    identity = _candidate_identity(item)
     status = item.note or "未验证"
     lines = [f"{index}. {tag} {identity} · {status}"]
     if item.url:
@@ -276,12 +283,13 @@ def build_text_summary(
     command: str,
     show_reference: bool = True,
     limit: int = 5,
+    eta_text: str = "约 60 秒",
 ) -> str:
     """给模型看的纯文字摘要，不带图片。"""
     outcome = task.outcome
     if outcome is None:
         if task.status == "running":
-            return f"搜索还在进行中（task_id={task.task_id}），大约 40 秒后可用 search_status 取结果。"
+            return f"搜索还在进行中（task_id={task.task_id}），{eta_text}后可用 search_status 取结果。"
         return f"任务失败：{task.error or '未知错误'}"
 
     lines = [f"任务 {task.task_id}：{_best_block(outcome)}"]
@@ -294,7 +302,7 @@ def build_text_summary(
             for engine, items in groups:
                 lines.append(f"[{_engine_name(engine)}]")
                 for index, item in enumerate(items, start=1):
-                    identity = item.handle or item.name or "（未识别）"
+                    identity = _candidate_identity(item)
                     detail = f"{index}. [{item.platform}] {identity} · {item.note or '未验证'}"
                     if item.url:
                         detail += f" · {item.url}"

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.extract import (  # noqa: E402
     extract_identity,
+    is_pixiv_platform,
     is_x_platform,
     platform_of,
     promote_sotwe,
@@ -126,6 +127,18 @@ class XPlatformPreferenceTest(unittest.TestCase):
         for platform in ("picazor.com", "B站", "抖音", "pixiv.net", ""):
             with self.subTest(platform=platform):
                 self.assertFalse(is_x_platform(platform))
+
+
+class PixivPlatformTest(unittest.TestCase):
+    def test_detects_pixiv(self) -> None:
+        self.assertTrue(is_pixiv_platform("pixiv.net"))
+        self.assertTrue(is_pixiv_platform("i.pximg.net"))
+        self.assertTrue(is_pixiv_platform("", "https://www.pixiv.net/artworks/12345"))
+
+    def test_fanbox_is_not_main_site(self) -> None:
+        for platform, url in (("Pixiv FANBOX", "https://xxx.fanbox.cc/posts/1"), ("Twitter", "https://x.com/a")):
+            with self.subTest(platform=platform):
+                self.assertFalse(is_pixiv_platform(platform, url))
 
 
 if __name__ == "__main__":

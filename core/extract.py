@@ -59,6 +59,15 @@ def is_x_platform(platform: str) -> bool:
     return "twitter" in text or text in {"x", "x.com"}
 
 
+def is_pixiv_platform(platform: str, url: str = "") -> bool:
+    """是否为 pixiv 主站结果（含 i.pximg.net 图床）。
+
+    插画路线用它把 pixiv 的原始出处顶到前面；FANBOX 属于赞助页，不算主站。
+    """
+    text = f"{platform or ''} {(urlparse(url).netloc or '')}".lower()
+    return "pixiv.net" in text or "pximg.net" in text
+
+
 def platform_of(url: str = "", source: str = "", title: str = "") -> str:
     """判断结果所在平台。"""
     host = (urlparse(url).netloc or source or "").lower()
