@@ -14,9 +14,9 @@ _HASH_SIDE = 8
 _TARGET_UPLOAD_BYTES = 480 * 1024
 _MIN_SIDE = 320
 # 12MB 的 JPEG 可以解出上亿像素，解码前先按尺寸拦一次，别把内存顶爆。
+# 不要改成 Image.MAX_IMAGE_PIXELS：那是 PIL 的模块级全局，会连累同一 runner 进程里
+# 的其他插件；下面每个入口都会在解码像素前用 _too_large() 自己拦一遍。
 MAX_PIXELS = 40_000_000
-
-Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 
 
 def _too_large(image: Image.Image) -> bool:

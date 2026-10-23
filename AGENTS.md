@@ -112,7 +112,7 @@ python -m unittest discover -s tests -v
 - 仓库内不要留 `plugin.py.upload_tmp`、`__pycache__`、日志、任务数据。
 - 不要在 README / AGENTS / 代码里出现真实 key、代理 IP、群号。
 - 下载远程图片必须先过 `httpclient.is_public_url`：群里构造的图片段能把 URL 指向本机或云元数据地址，别绕开这道校验。
-- 解码前先看像素数（`hashing.MAX_PIXELS`）：小体积不等于小像素，纯色长图能几百 KB 解出上亿像素。
+- 解码前先看像素数（`hashing.MAX_PIXELS`）：小体积不等于小像素，纯色长图能几百 KB 解出上亿像素。**不要改 `Image.MAX_IMAGE_PIXELS`**：那是 PIL 的模块级全局，会连累同一 runner 进程里的其他插件；`_too_large()` 已经在解码像素前逐个入口拦过了。
 - 不要提交个人环境的定制值（例如改过的 `command`、`nickname`、代理地址、`db_full_groups` 里的真实群号）；仓库只保留默认的「麦麦寻人」与示例配置。
 - **截图必须脱敏**：群名、昵称、QQ 头像、对方账号、露骨标题都要遮盖或打码；真人裸露照片不要放原图，README 里的效果图优先用虚构字段的示意图（`assets/preview-result.png` 就是脚本生成的）。
 - 提交前扫一遍：`grep -rn "@[A-Za-z0-9_]\{2,\}" README.md AGENTS.md` 与 `grep -rn "127.0.0.1\|OnlyFans" README.md`。
