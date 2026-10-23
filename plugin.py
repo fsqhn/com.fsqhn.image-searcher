@@ -201,11 +201,11 @@ class SauceNaoConfig(EngineConfig):
         ),
     )
     db_policy_enabled: bool = Field(
-        default=False,
+        default=True,
         description="是否按群启用名单策略。关闭时所有群都用上面的「全量检索的库」。",
         json_schema_extra=_ui(
             "启用按群名单",
-            "打开后：名单里的群全量检索，其他群收紧。想反过来就把下面的「名单反转」打开。",
+            "打开后：名单里的群全量检索，其他群收紧。名单留空就是所有群都收紧。想反过来把「名单反转」打开。",
         ),
     )
     db_full_groups: list[str] = Field(
@@ -213,7 +213,7 @@ class SauceNaoConfig(EngineConfig):
         description="名单里的群号。填群号即可（例如 123456789），也认会话 ID。",
         json_schema_extra=_ui(
             "名单（群号）",
-            "填群号，点「添加」可以加多个。默认这些群走全量，其他群收紧。",
+            "填群号，点「添加」可以加多个。这些群走全量，其他群收紧；留空就是所有群都收紧。",
         ),
     )
     db_policy_invert: bool = Field(

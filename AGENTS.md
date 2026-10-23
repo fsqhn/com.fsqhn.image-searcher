@@ -36,7 +36,7 @@ core/maibot_compat.py  能力返回值解包
 
 **用户可见文案不要写死插件名**：转发标题、补图提示、「更多」提示统一用 `COMMAND`（来自配置），只有 `_manifest.json`、包名和 README 用固定的「麦麦寻人」。标题里写死会导致用户把指令改成别的名字后，卡片还顶着旧名字。
 
-**SauceNAO 库策略**：`db` 是全量库，`db_strict` 是收紧库，`db_policy_enabled` 开关，`db_full_groups` 名单，`db_policy_invert` 反转含义。选库逻辑在 `core/engines.py` 的 `resolve_saucenao_db()`，纯函数、有独立用例（`tests/test_dbpolicy.py`），改语义先改那里的测试。开关关闭或名单为空时一律走 `db`。
+**SauceNAO 库策略**：`db` 是全量库，`db_strict` 是收紧库，`db_policy_enabled` 开关（**默认开启**），`db_full_groups` 名单，`db_policy_invert` 反转含义。选库逻辑在 `core/engines.py` 的 `resolve_saucenao_db()`，纯函数、有独立用例（`tests/test_dbpolicy.py`），改语义先改那里的测试。开关关闭时一律走 `db`；开关开着时名单上的群走 `db`、其他群走 `db_strict`，**名单为空等于所有群都收紧**，别把「名单空回退全量」加回去。
 
 **群号到会话 ID 的映射**：入站钩子里 `_remember_group()` 把 `stream_id` 和群号记到内存表（`_stream_groups`），`_group_of()` 反查。名单里既能填群号也能填会话 ID，`group_listed()` 会去 `g` 前缀比对。注意这张表是内存态，重载后为空——名单只填群号时，重启后第一条消息进来才会建立映射，别把它当持久化存储。
 

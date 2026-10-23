@@ -392,9 +392,10 @@ def resolve_saucenao_db(
     """按群决定 SauceNAO 用哪个库。
 
     关闭名单策略时一律走全量；打开后默认「名单上的群全量、其他群收紧」，
-    invert 反转为「名单上的群收紧、其他群全量」。
+    invert 反转为「名单上的群收紧、其他群全量」。名单为空时视为所有人
+    都在名单外，即全部收紧（invert 时全部全量）。
     """
-    if not policy_enabled or not groups:
+    if not policy_enabled:
         return db_full
     listed = group_listed(groups, stream_id, group_id)
     if invert:

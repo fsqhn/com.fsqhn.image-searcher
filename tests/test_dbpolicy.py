@@ -28,8 +28,9 @@ class DbPolicyTest(unittest.TestCase):
     def test_disabled_always_full(self) -> None:
         self.assertEqual(_db(policy_enabled=False), FULL)
 
-    def test_empty_list_always_full(self) -> None:
-        self.assertEqual(_db(groups=[]), FULL)
+    def test_empty_list_means_everyone_unlisted(self) -> None:
+        self.assertEqual(_db(groups=[]), STRICT)
+        self.assertEqual(_db(groups=[], invert=True), FULL)
 
     def test_listed_group_uses_full_by_default(self) -> None:
         self.assertEqual(_db(group_id="123456789"), FULL)

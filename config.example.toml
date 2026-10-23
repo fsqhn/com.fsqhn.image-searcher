@@ -91,9 +91,9 @@ route_similarity = 75
 max_results = 4
 
 # 库策略：控制 SauceNAO 查哪些索引库（db 参数）。
-# db=999 是全库，命中率高但可能带回成人站点；收紧到具体库命中率会下降。
+# 默认开启：名单上的群走全量（db=999），其他群收紧；收紧后冷门插画命中率会略降。
 # 关闭开关时一律用「全量检索的库」。
-db_policy_enabled = false
+db_policy_enabled = true
 # 全量检索时用的库，999 表示全部。
 db = "999"
 # 收紧检索时用的库，逗号分隔。5=pixiv 6=twitter 21=anime-pictures 24=anime
