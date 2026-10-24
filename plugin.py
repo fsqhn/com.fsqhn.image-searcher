@@ -1640,14 +1640,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
         "image_search",
         brief_description="用户发来图片、想查这张图的原始出处或作者社交账号时使用。",
         detailed_description=(
-            "从当前聊天里取一张图片，反查它的原始出处与账号。"
-            "取图范围：用户引用的那张图，或当前会话最近 3 分钟内收到的图；"
-            "更早的图取不到，此时应让用户在消息里引用那张图再试，不要反复重试本工具。"
+            "对聊天里的某张图片做以图搜图，反查原始出处与账号。"
+            "上下文里每条消息都带 <message msg_id=\"...\">，想搜哪张图就把那条消息的 msg_id 传进来，"
+            "几小时前的图也能取；不传时依次取「用户引用的图」和「当前会话最近 3 分钟内收到的图」。"
             "搜索通常要 1 分钟上下（开了深度检索更久），因此本工具立即返回 task_id，不等待结果。"
             "返回后请告诉用户「正在搜索，约 1 分钟」，稍后再调用 search_status 取结果。"
             "本工具只返回文字摘要，不会发图片。"
         ),
         parameters=[
+            ToolParameterInfo(
+                name="msg_id",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "要搜的那条带图消息的 msg_id，从上下文 <message msg_id=\"...\"> 里抄，只填数字。"
+                    "不填就取用户引用的图或最近 3 分钟内的图。"
+                ),
+                required=False,
+            ),
             ToolParameterInfo(
                 name="note",
                 param_type=ToolParamType.STRING,
@@ -1656,10 +1665,24 @@ class ImageSearcherPlugin(MaiBotPlugin):
             ),
         ],
     )
-    async def image_search(self, note: str = "", **kwargs: Any) -> dict[str, Any]:
+    async def image_search(self, note: str = "", msg_id: str = "", **kwargs: Any) -> dict[str, Any]:
         stream_id = self._stream_id(kwargs)
         user_id = self._user_id(kwargs)
-        raw, image_url, source, stale = await self._resolve_image(kwargs, allow_recent=True)
+        wanted = "".join(ch for ch in str(msg_id or "") if ch.isdigit())
+        if wanted:
+            # 模型点名了具体消息：直接按 ID 取，不受 3 分钟窗口限制。
+            found_raw, found_url = await self._image_by_id(wanted, stream_id)
+            if found_raw:
+                raw, image_url, source, stale = found_raw, found_url, "指定的消息", 0
+            else:
+                message = (
+                    f"按 msg_id={wanted} 没取到图片。请确认那是带图消息的 msg_id（上下文里 <message msg_id=\"...\"> 的数字），"
+                    "或者让用户引用那张图再试。"
+                )
+                self.ctx.logger.warning("Tool 指定的消息没有图片：msg_id=%s", wanted)
+                return {"success": False, "content": message, "message": message}
+        else:
+            raw, image_url, source, stale = await self._resolve_image(kwargs, allow_recent=True)
         self._vlog("Tool 取图：来源=%s 体积=%sKB 链接=%s", source or "无", len(raw) // 1024 if raw else 0, (image_url or "无")[:80])
         if not raw:
             if stale:

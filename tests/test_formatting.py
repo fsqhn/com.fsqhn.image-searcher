@@ -271,9 +271,10 @@ class EtaTextTest(unittest.TestCase):
 
 
 class StaleImageHintTest(unittest.TestCase):
-    def test_hint_mentions_minutes_and_quote(self) -> None:
+    def test_hint_mentions_minutes_and_msg_id(self) -> None:
         text = stale_image_hint(15_600)
         self.assertIn("260 分钟", text)
+        self.assertIn("msg_id", text)
         self.assertIn("引用", text)
         self.assertIn("不是图片服务故障", text)
 
