@@ -935,8 +935,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
         entry = self._image_cache.get(message_id)
         return entry[1] if entry else None
 
-    async def _resolve_image(self, kwargs: dict, *, allow_recent: bool = False) -> tuple[bytes | None, str, str]:
-        """返回 (图片字节, 图片链接, 来源说明)。"""
+    async def _resolve_image(
+        self,
+        kwargs: dict,
+        *,
+        allow_recent: bool = False,
+    ) -> tuple[bytes | None, str, str, int]:
+        """返回 (图片字节, 图片链接, 来源说明, 过期秒数)。
+
+        过期秒数大于 0 表示「找到了图，但早于取图窗口」——这种情况要让模型去引导用户引用，
+        而不是笼统说一句「没有图片」。
+        """
         message = kwargs.get("message")
         stream_id = self._stream_id(kwargs)
         segments = _segments_of(message)
@@ -944,39 +953,40 @@ class ImageSearcherPlugin(MaiBotPlugin):
         raw, inline_url = _first_image(message)
         url = inline_url
         if raw:
-            return raw, url, "当前消息"
+            return raw, url, "当前消息", 0
 
         message_id = self._message_id(kwargs)
         if message_id:
             cached = self._cached_image(message_id)
             if cached:
-                return cached, "", "当前消息"
+                return cached, "", "当前消息", 0
 
         # Command 传入的消息不带二进制，先按 message_id 找 Host 要一次，
         # 比直接下载 QQ 图链更稳（图链可能过期或被防盗链挡）。
         if message_id:
             found_raw, found_url = await self._image_by_id(message_id, stream_id)
             if found_raw:
-                return found_raw, found_url or url, "当前消息"
+                return found_raw, found_url or url, "当前消息", 0
 
         if url:
             downloaded = await self._download(url)
             if downloaded:
-                return downloaded, url, "当前消息"
+                return downloaded, url, "当前消息", 0
 
         reply_id = _reply_target(segments, message if isinstance(message, dict) else {})
         if reply_id:
             found_raw, found_url = await self._image_by_id(reply_id, stream_id)
             if found_raw:
-                return found_raw, found_url, "引用的消息"
+                return found_raw, found_url, "引用的消息", 0
 
         if allow_recent and stream_id:
-            recent = await self._recent_images(stream_id)
-            if recent:
-                found_raw, found_url = recent
-                return found_raw, found_url, "最近的图片消息"
+            found_raw, found_url, stale = await self._recent_images(stream_id)
+            if found_raw:
+                return found_raw, found_url, "最近的图片消息", 0
+            if stale:
+                return None, url, "", stale
 
-        return None, url, ""
+        return None, url, "", 0
 
     async def _image_by_id(self, message_id: str, stream_id: str) -> tuple[bytes | None, str]:
         if not message_id:
@@ -1011,16 +1021,18 @@ class ImageSearcherPlugin(MaiBotPlugin):
         self.ctx.logger.warning("按消息 ID 没有取回消息体：id=%s", message_id)
         return None, ""
 
-    async def _recent_images(self, stream_id: str) -> tuple[bytes, str] | None:
+    async def _recent_images(self, stream_id: str) -> tuple[bytes | None, str, int]:
+        """返回 (图片字节, 链接, 过期秒数)。过期秒数只在「有图但太旧」时非 0。"""
         try:
             result = await self.ctx.message.get_recent(chat_id=stream_id, limit=6)
         except Exception as error:  # noqa: BLE001
             self.ctx.logger.warning("读取最近消息失败：%s", error)
-            return None
+            return None, "", 0
         messages = unwrap_capability(result, "messages")
         if not isinstance(messages, list):
-            return None
+            return None, "", 0
         now = time.time()
+        stale = 0
         for item in reversed(messages):
             if not _has_image(item):
                 continue
@@ -1030,11 +1042,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 stamp = 0.0
             # 只认最近 3 分钟内的图，避免模型在闲聊时抓到很久以前的图
             if stamp and now - stamp > 180:
+                stale = max(stale, int(now - stamp))
                 continue
             found_raw, found_url = await self._image_by_id(str(item.get("message_id") or ""), stream_id)
             if found_raw:
-                return found_raw, found_url
-        return None
+                return found_raw, found_url, 0
+        return None, "", stale
 
     async def _download(self, url: str) -> bytes | None:
         try:
@@ -1627,7 +1640,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         "image_search",
         brief_description="用户发来图片、想查这张图的原始出处或作者社交账号时使用。",
         detailed_description=(
-            "从当前聊天里取最近一张图片（或用户引用的图片），反查它的原始出处与账号。"
+            "从当前聊天里取一张图片，反查它的原始出处与账号。"
+            "取图范围：用户引用的那张图，或当前会话最近 3 分钟内收到的图；"
+            "更早的图取不到，此时应让用户在消息里引用那张图再试，不要反复重试本工具。"
             "搜索通常要 1 分钟上下（开了深度检索更久），因此本工具立即返回 task_id，不等待结果。"
             "返回后请告诉用户「正在搜索，约 1 分钟」，稍后再调用 search_status 取结果。"
             "本工具只返回文字摘要，不会发图片。"
@@ -1644,10 +1659,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
     async def image_search(self, note: str = "", **kwargs: Any) -> dict[str, Any]:
         stream_id = self._stream_id(kwargs)
         user_id = self._user_id(kwargs)
-        raw, image_url, source = await self._resolve_image(kwargs, allow_recent=True)
+        raw, image_url, source, stale = await self._resolve_image(kwargs, allow_recent=True)
         self._vlog("Tool 取图：来源=%s 体积=%sKB 链接=%s", source or "无", len(raw) // 1024 if raw else 0, (image_url or "无")[:80])
         if not raw:
-            message = "没有找到可用的图片。请让用户先发一张图，或引用一条带图的消息再试。"
+            if stale:
+                message = formatting.stale_image_hint(stale)
+            else:
+                message = "没有找到可用的图片。请让用户先发一张图，或引用一条带图的消息再试。"
             return {"success": False, "content": message, "message": message}
 
         try:
@@ -1753,7 +1771,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not deadline or time.time() > deadline:
             return False, "", 0
 
-        raw, image_url, _source = await self._resolve_image(kwargs, allow_recent=False)
+        raw, image_url, _source, _stale = await self._resolve_image(kwargs, allow_recent=False)
         if not raw:
             self.ctx.logger.warning("等待中的图片消息没有取到图，继续等：key=%s", key)
             await self.ctx.send.text("这张图我这边没取到，再发一次试试。", current)
@@ -1808,7 +1826,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not current:
             return False, "无法获取会话 ID", 1
 
-        raw, image_url, source = await self._resolve_image(kwargs)
+        raw, image_url, source, _stale = await self._resolve_image(kwargs)
         self._vlog("指令取图：来源=%s 体积=%sKB 链接=%s", source or "无", len(raw) // 1024 if raw else 0, (image_url or "无")[:80])
         if not raw:
             await self._wait_for_image(current, user_id)

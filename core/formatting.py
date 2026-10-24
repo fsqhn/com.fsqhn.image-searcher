@@ -277,6 +277,15 @@ def build_engine_forward_nodes(
     return nodes
 
 
+def stale_image_hint(stale_seconds: int) -> str:
+    """图找到了、但早于取图窗口时给模型的提示：引导引用，而不是说没有图。"""
+    minutes = max(1, int(stale_seconds) // 60)
+    return (
+        f"当前会话最近一张图是约 {minutes} 分钟前发的，已经超出 3 分钟的取图窗口，所以取不到。"
+        "这不是图片服务故障，不要反复重试。请让用户引用那张图再发一次，或者重新发图。"
+    )
+
+
 def build_text_summary(
     task: SearchTask,
     *,

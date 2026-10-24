@@ -10,6 +10,7 @@ from core.formatting import (
     build_forward_nodes,
     build_text_summary,
     engine_groups,
+    stale_image_hint,
 )
 from core.tasks import SearchOutcome, SearchTask
 
@@ -267,6 +268,17 @@ class EtaTextTest(unittest.TestCase):
         text = build_text_summary(task, command="麦麦寻人", eta_text="约 2 分钟")
         self.assertIn("约 2 分钟", text)
         self.assertNotIn("40 秒", text)
+
+
+class StaleImageHintTest(unittest.TestCase):
+    def test_hint_mentions_minutes_and_quote(self) -> None:
+        text = stale_image_hint(15_600)
+        self.assertIn("260 分钟", text)
+        self.assertIn("引用", text)
+        self.assertIn("不是图片服务故障", text)
+
+    def test_under_one_minute_rounds_up(self) -> None:
+        self.assertIn("1 分钟", stale_image_hint(30))
 
 
 if __name__ == "__main__":
