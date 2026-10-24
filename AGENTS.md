@@ -111,6 +111,7 @@ python -m unittest discover -s tests -v
 - `config.toml` 不要提交；确认仓库里只有 `config.example.toml`。
 - 仓库内不要留 `plugin.py.upload_tmp`、`__pycache__`、日志、任务数据。
 - 不要在 README / AGENTS / 代码里出现真实 key、代理 IP、群号。
+- 下载候选图统一走 `download_image_multi`：按主机选线路，瞬时错误（TLS 被掐断、超时、连接重置、5xx）会换线路重试，对端明确拒绝（4xx、地址不合规）不重试。别绕过它直接 `download_image`，Yandex 图床经常第一次就被 EOF 掐断。
 - 下载远程图片必须先过 `httpclient.is_public_url`：群里构造的图片段能把 URL 指向本机或云元数据地址，别绕开这道校验。
 - **取图窗口要能解释清楚**：模型侧工具优先按 `msg_id` 取图（`ctx.message.get_by_id`，不受时间限制），其次引用，最后才是「最近 3 分钟内的图」（`_recent_images` 的 180 秒）。超窗时 `_resolve_image` 会带回过期秒数，由 `stale_image_hint()` 告诉模型把 msg_id 传进来；别写成「没有图片」，模型会误判成插件故障并反复重试。
 - 解码前先看像素数（`hashing.MAX_PIXELS`）：小体积不等于小像素，纯色长图能几百 KB 解出上亿像素。**不要改 `Image.MAX_IMAGE_PIXELS`**：那是 PIL 的模块级全局，会连累同一 runner 进程里的其他插件；`_too_large()` 已经在解码像素前逐个入口拦过了。

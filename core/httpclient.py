@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -86,18 +87,46 @@ def download_routes(url: str, proxy: str = "") -> list[str]:
     return ordered
 
 
-def download_image_multi(url: str, proxy: str = "", timeout: float = 15.0) -> bytes:
-    """下载图片，失败时换另一条线路再试一次。
+# 这些错误是瞬时的（TLS 被中途掐断、连接重置、超时），换线路或重试一次通常就能过。
+_RETRY_HINTS = (
+    "sslerror",
+    "ssleoferror",
+    "eof",
+    "timeout",
+    "timed out",
+    "connection",
+    "reset",
+    "max retries",
+    "http 5",
+)
 
-    Yandex 图床直连优先（代理反而更慢），其他站点先走代理；两条都不通才报错，
-    错误信息取最后一次的结果。
+
+def is_transient_error(error: BaseException) -> bool:
+    """判断下载失败是否值得重试：对端明确拒绝（4xx）或内容不合规就不重试。"""
+    text = str(error).lower()
+    return any(hint in text for hint in _RETRY_HINTS)
+
+
+def download_image_multi(url: str, proxy: str = "", timeout: float = 15.0, attempts: int = 3) -> bytes:
+    """下载图片，失败时换线路并重试。
+
+    Yandex 图床直连优先（代理反而更慢），其他站点先走代理。TLS 被中途掐断这类
+    瞬时错误很常见，单次尝试经常白给，所以按线路轮换重试几次；对端明确拒绝的
+    （403/404、地址不合规）不浪费次数。
     """
+    routes = download_routes(url, proxy)
     last_error: HttpError | None = None
-    for route in download_routes(url, proxy):
+    total = max(1, attempts)
+    for index in range(total):
+        route = routes[index % len(routes)]
         try:
             return download_image(url, route, timeout)
         except HttpError as exc:
             last_error = exc
+            if not is_transient_error(exc):
+                break
+            if index + 1 < total:
+                time.sleep(0.3)
     raise last_error or HttpError("图片下载失败")
 
 
