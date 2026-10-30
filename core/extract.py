@@ -68,6 +68,52 @@ def is_pixiv_platform(platform: str, url: str = "") -> bool:
     return "pixiv.net" in text or "pximg.net" in text
 
 
+_SOCIAL_HOSTS = (
+    "x.com",
+    "twitter.com",
+    "twimg.com",
+    "sotwe.com",
+    "weibo.com",
+    "weibo.cn",
+    "xiaohongshu.com",
+    "xhslink.com",
+    "instagram.com",
+    "facebook.com",
+    "threads.net",
+    "tiktok.com",
+    "douyin.com",
+    "bilibili.com",
+    "b23.tv",
+    "pixiv.net",
+    "pximg.net",
+    "reddit.com",
+    "pinterest.com",
+    "pinterest.jp",
+    "youtube.com",
+    "youtu.be",
+    "vk.com",
+    "t.me",
+)
+
+
+def is_social_platform(url: str = "", source: str = "") -> bool:
+    """是否为社交平台结果。
+
+    照片路线用它优先核对「原帖最可能在哪」：这些站点上的候选即使超出
+    常规验证配额，也要补进去比一次。按域名后缀精确匹配，避免 netflix.com
+    这类域名被 x.com 误判。
+    """
+    host = (urlparse(url).netloc or "").strip().lower()
+    hosts = [host] if host else []
+    if source:
+        hosts.append(str(source).strip().lower())
+    for item in hosts:
+        item = item.rsplit("@", 1)[-1].split(":")[0]
+        if item and any(item == token or item.endswith("." + token) for token in _SOCIAL_HOSTS):
+            return True
+    return False
+
+
 def platform_of(url: str = "", source: str = "", title: str = "") -> str:
     """判断结果所在平台。"""
     host = (urlparse(url).netloc or source or "").lower()

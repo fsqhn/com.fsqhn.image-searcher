@@ -55,6 +55,7 @@ class Candidate:
     title: str = ""
     source: str = ""
     image_url: str = ""
+    fallback_image: str = ""
     similarity: float | None = None
     distance: int | None = None
     status: str = "unverified"  # match / suspect / unverified / mismatch
@@ -247,6 +248,12 @@ def parse_yandex_sites(page: str) -> list[dict] | None:
 def to_yandex_candidate(site: dict, engine: str) -> Candidate:
     url = clean_url(str(site.get("url") or ""))
     title = str(site.get("title") or "")
+    # thumb 是 yandex 裁成 148×90 的方框缩略图，裁剪本身就会把指纹打乱，
+    # 拿它比对必然大面积「不符」。originalImage 才是站点上的原图。
+    original = site.get("originalImage") or {}
+    image = str(original.get("url") or "")
+    if image.startswith("//"):
+        image = "https:" + image
     thumb = str((site.get("thumb") or {}).get("url") or "")
     if thumb.startswith("//"):
         thumb = "https:" + thumb
@@ -256,8 +263,9 @@ def to_yandex_candidate(site: dict, engine: str) -> Candidate:
         url=url,
         title=title,
         source=str(site.get("domain") or ""),
-        image_url=thumb,
-        note="缩略图比对" if thumb else "",
+        image_url=image or thumb,
+        fallback_image=thumb if image else "",
+        note="原图比对" if image else ("缩略图比对" if thumb else ""),
     ).finalize()
 
 
@@ -605,9 +613,17 @@ def verify_candidate(
     try:
         raw = download_image_multi(candidate.image_url, proxy, timeout=timeout)
     except HttpError as exc:
-        candidate.status = "unverified"
-        candidate.note = f"候选图下载失败：{str(exc)[:60]}"
-        return candidate
+        if candidate.fallback_image:
+            try:
+                raw = download_image_multi(candidate.fallback_image, proxy, timeout=timeout)
+            except HttpError:
+                candidate.status = "unverified"
+                candidate.note = f"候选图下载失败：{str(exc)[:60]}"
+                return candidate
+        else:
+            candidate.status = "unverified"
+            candidate.note = f"候选图下载失败：{str(exc)[:60]}"
+            return candidate
 
     candidate_hash = dhash(raw)
     if candidate_hash is None:

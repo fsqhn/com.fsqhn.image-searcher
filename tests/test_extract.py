@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core.extract import (  # noqa: E402
     extract_identity,
     is_pixiv_platform,
+    is_social_platform,
     is_x_platform,
     platform_of,
     promote_sotwe,
@@ -139,6 +140,42 @@ class PixivPlatformTest(unittest.TestCase):
         for platform, url in (("Pixiv FANBOX", "https://xxx.fanbox.cc/posts/1"), ("Twitter", "https://x.com/a")):
             with self.subTest(platform=platform):
                 self.assertFalse(is_pixiv_platform(platform, url))
+
+
+class SocialPlatformTest(unittest.TestCase):
+    """社交平台候选要能认出来，普通站点不能被误判。"""
+
+    def test_detects_main_social_sites(self) -> None:
+        for url in (
+            "https://x.com/NERUchi890/status/2111815792396493110",
+            "https://twitter.com/a/status/1",
+            "https://weibo.com/1234/abcd",
+            "https://m.weibo.cn/detail/456",
+            "https://www.xiaohongshu.com/explore/abc",
+            "https://www.instagram.com/p/abc/",
+            "https://www.bilibili.com/video/BV1xx",
+            "https://b23.tv/abc",
+            "https://www.pixiv.net/artworks/12345",
+            "https://t.me/somechannel/12",
+            "https://www.pinterest.com/pin/1/",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(is_social_platform(url))
+
+    def test_falls_back_to_source(self) -> None:
+        self.assertTrue(is_social_platform("", "x.com"))
+        self.assertTrue(is_social_platform("https://example.org/a", "weibo.com"))
+
+    def test_plain_sites_are_not_social(self) -> None:
+        for url in (
+            "https://netflix.com/title/1",
+            "https://skebetter.com/author/1",
+            "https://dto.to/title/157409",
+            "https://www.google.com/search?q=1",
+            "",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(is_social_platform(url))
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ from .core.engines import (
     detect_ai,
     verify_candidate,
 )
-from .core.extract import is_pixiv_platform, is_x_platform
+from .core.extract import is_pixiv_platform, is_social_platform, is_x_platform
 from .core.hashing import dhash, prepare_upload
 from .core.httpclient import HttpError, download_image_multi
 from .core.keypool import KeyPool
@@ -392,6 +392,27 @@ class PluginSectionConfig(PluginConfigBase):
         ),
         ge=1,
         le=30,
+    )
+    social_verify_all: bool = Field(
+        default=True,
+        description=(
+            "照片路线优先核对社交平台：X、微博、小红书、Instagram、B站、pixiv 等站点的候选，"
+            "即使超出每引擎验证配额，也补进去做一次指纹比对。原帖基本都在这些平台上。"
+        ),
+        json_schema_extra=_ui(
+            "优先核对社交平台结果",
+            "默认开。关掉后只按每引擎验证条数取前几条。",
+        ),
+    )
+    social_verify_limit: int = Field(
+        default=20,
+        description="上面那个开关一次最多补验几条社交平台候选，防止平台结果太多把搜索拖长。",
+        json_schema_extra=_ui(
+            "社交平台补验上限",
+            "默认 20。只有开了「优先核对社交平台结果」才生效。",
+        ),
+        ge=1,
+        le=60,
     )
     image_wait_seconds: int = Field(
         default=60,
@@ -1297,6 +1318,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
         section = self.config.plugin
         deep = bool(section.deep_scan)
         targets: list[Candidate] = []
+        social_extra: list[Candidate] = []
+        social_enabled = bool(getattr(section, "social_verify_all", False))
         for name in names:
             if name == "saucenao":
                 continue
@@ -1306,6 +1329,25 @@ class ImageSearcherPlugin(MaiBotPlugin):
             normal = max(1, section.verify_top_n) * 2 if name == "lens" else max(1, section.verify_top_n)
             limit = max(1, int(section.deep_verify_top_n), normal) if deep else normal
             targets.extend(items[:limit])
+            if not social_enabled:
+                continue
+            # 原帖基本都在社交平台上：X、微博、小红书这些站点的候选即使排在
+            # 每引擎配额之外，也补一次指纹比对，否则最该核对的那批反而被截断。
+            for item in items[limit:]:
+                if is_social_platform(item.url, item.source):
+                    social_extra.append(item)
+        if social_extra:
+            seen = {item.url for item in targets}
+            social_extra = [item for item in social_extra if item.url not in seen]
+            cap = max(1, int(section.social_verify_limit))
+            picked_social = social_extra[:cap]
+            targets.extend(picked_social)
+            self._vlog(
+                "社交平台补验：候选=%s 补验=%s 上限=%s",
+                len(social_extra),
+                len(picked_social),
+                cap,
+            )
         if not targets:
             return
 

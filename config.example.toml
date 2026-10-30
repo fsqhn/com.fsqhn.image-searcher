@@ -27,6 +27,12 @@ more_limit = 10
 # 取 2 倍（N=3 时验证 6 条）。SauceNAO 用自带相似度，不下载比对。
 verify_top_n = 3
 
+# 照片路线优先核对社交平台：X、微博、小红书、Instagram、B站、pixiv 这些站点的
+# 候选即使超出上面的验证配额，也补进去比一次指纹——原帖基本都在这些平台。
+# social_verify_limit 是一次最多补验几条，防止结果太多把搜索拖长。
+social_verify_all = true
+social_verify_limit = 20
+
 # 深度检索：打开后每个引擎不只取前几条，而是按 deep_scan_limit 尽量多取，
 # 并在验证阶段按 deep_verify_top_n 多比对几张。命中率更高，耗时大约翻倍。
 deep_scan = false

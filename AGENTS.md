@@ -36,6 +36,10 @@ core/maibot_compat.py  能力返回值解包
 
 **取数分两档**：`deep_scan=false` 时每引擎取 `max_results` 条、验证 `verify_top_n`（Lens 2N）、「更多」展示 `more_limit`；`deep_scan=true` 时每引擎取到 `deep_scan_limit`、验证 `deep_verify_top_n`、「更多」展示 `deep_more_limit`。改取数只动这一处，别在引擎里另加截断。
 
+**比对必须用原图，不能用方框缩略图**：Yandex 的 `thumb` 是裁成 148×90 的方框，裁剪会把 dHash 打乱，拿它比对会大面积误判「不符」。`to_yandex_candidate()` 优先取 `originalImage.url`，没有才回退 `thumb` 并在 note 里标明。新增引擎照这个规矩来：能拿到站点原图就别用缩略图。
+
+**照片路线优先核对社交平台**：`_verify()` 里按每引擎配额取完候选后，还要把排在配额之外的社交平台候选（`is_social_platform()`，认 X、微博、小红书、Instagram、B站、pixiv、Telegram 等域名）补进验证队列，上限 `social_verify_limit`，开关 `social_verify_all`。原帖基本都在这些平台，按固定条数截断最容易正好把它们漏掉。
+
 **配置热更新有限**：`self.config` 会热更新，但 `@Command` 的 `pattern` 是模块导入时生成的。改 `command` / `aliases` 必须重载插件。
 
 **用户可见文案不要写死插件名**：转发标题、补图提示、「更多」提示统一用 `COMMAND`（来自配置），只有 `_manifest.json`、包名和 README 用固定的「麦麦寻人」。标题里写死会导致用户把指令改成别的名字后，卡片还顶着旧名字。
