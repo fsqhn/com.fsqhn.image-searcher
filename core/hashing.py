@@ -50,11 +50,19 @@ def hamming(left: int, right: int) -> int:
     return (left ^ right).bit_count()
 
 
-def prepare_upload(raw: bytes, limit: int = _TARGET_UPLOAD_BYTES) -> tuple[bytes, str]:
+def prepare_upload(
+    raw: bytes,
+    limit: int = _TARGET_UPLOAD_BYTES,
+    *,
+    as_jpeg: bool = False,
+) -> tuple[bytes, str]:
     """把图片压到上传接口能接受的大小，返回 (字节, mime)。
 
     SerpAPI 的 Image API 上限 500KB；Yandex 与百度虽然更宽松，但统一压一次
     可以减少传输时间，也避免长图把整次搜索拖慢。
+
+    `as_jpeg=True` 用于「要发到 QQ 里的图」：QQ 对 webp 的兼容很差，
+    合并转发的图片节点会变成空白，所以这里强制转成 JPEG。
     """
     if not raw:
         return raw, "image/jpeg"
@@ -67,7 +75,11 @@ def prepare_upload(raw: bytes, limit: int = _TARGET_UPLOAD_BYTES) -> tuple[bytes
         raise
     except Exception:  # noqa: BLE001 - 解不开的图交给下面的分支按原逻辑处理
         pass
-    if len(raw) <= limit and _sniff_mime(raw) in {"image/jpeg", "image/png", "image/webp"}:
+    if (
+        not as_jpeg
+        and len(raw) <= limit
+        and _sniff_mime(raw) in {"image/jpeg", "image/png", "image/webp"}
+    ):
         return raw, _sniff_mime(raw)
 
     try:

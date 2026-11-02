@@ -122,6 +122,21 @@ class PrepareUploadTest(unittest.TestCase):
         compact, _mime = prepare_upload(raw, limit=480 * 1024)
         self.assertEqual(compact, raw)
 
+    def test_as_jpeg_converts_webp(self) -> None:
+        """QQ 合并转发不认 webp，发出去的图必须先转成 JPEG。"""
+        buffer = io.BytesIO()
+        Image.new("RGB", (400, 300), (200, 120, 60)).save(buffer, format="WEBP")
+        raw = buffer.getvalue()
+        self.assertLess(len(raw), 480 * 1024)
+
+        untouched, mime = prepare_upload(raw, limit=480 * 1024)
+        self.assertEqual(mime, "image/webp")
+        self.assertEqual(untouched, raw)
+
+        converted, jpeg_mime = prepare_upload(raw, limit=480 * 1024, as_jpeg=True)
+        self.assertEqual(jpeg_mime, "image/jpeg")
+        self.assertTrue(converted.startswith(b"\xff\xd8"))
+
 
 if __name__ == "__main__":
     unittest.main()

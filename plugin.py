@@ -1133,13 +1133,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 if isinstance(data, BaseException) or not data:
                     continue
                 try:
-                    compact, _ = prepare_upload(data, limit=1_200_000)
+                    compact, _ = prepare_upload(data, limit=1_200_000, as_jpeg=True)
                 except Exception:  # noqa: BLE001 - 解不开就换下一张
                     continue
                 return base64.b64encode(compact).decode("ascii"), url
         if upload is None:
             return "", ""
-        compact, _ = prepare_upload(upload, limit=1_200_000)
+        compact, _ = prepare_upload(upload, limit=1_200_000, as_jpeg=True)
         return base64.b64encode(compact).decode("ascii"), "upload"
 
     async def _ensure_image(self, task: SearchTask) -> None:
@@ -1164,7 +1164,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not raw:
             return ""
         try:
-            compact, _mime = await asyncio.to_thread(prepare_upload, raw, self._DISPLAY_IMAGE_BYTES)
+            compact, _mime = await asyncio.to_thread(prepare_upload, raw, self._DISPLAY_IMAGE_BYTES, as_jpeg=True)
         except Exception:  # noqa: BLE001 - 解不开就不附图，不影响文字结果
             return ""
         return base64.b64encode(compact).decode("ascii")
