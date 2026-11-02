@@ -14,7 +14,7 @@ from core.extract import (  # noqa: E402
     is_social_platform,
     is_x_platform,
     platform_of,
-    promote_sotwe,
+    promote_mirror,
     relevance_rank,
 )
 from core.keypool import KeyPool  # noqa: E402
@@ -58,19 +58,27 @@ class ExtractIdentityTest(unittest.TestCase):
 
 
 class PromoteSotweTest(unittest.TestCase):
-    """sotwe 镜像还原成 x.com；handle 以标题为准，避免路径多余下划线。"""
+    """X 镜像站还原成 x.com；handle 以标题为准，避免路径多余下划线。"""
 
     def test_promote_uses_title_handle(self) -> None:
-        url, title = promote_sotwe("https://sotwe.com/usagi_rr_", "荣小兔头 @usagi_rr - Twitter")
+        url, title = promote_mirror("https://sotwe.com/usagi_rr_", "荣小兔头 @usagi_rr - Twitter")
         self.assertEqual(url, "https://x.com/usagi_rr")
         self.assertEqual(title, "荣小兔头 @usagi_rr")
 
     def test_promote_falls_back_to_path(self) -> None:
-        url, _title = promote_sotwe("https://sotwe.com/miaomiaonyaw", "喵喵")
+        url, _title = promote_mirror("https://sotwe.com/miaomiaonyaw", "喵喵")
         self.assertEqual(url, "https://x.com/miaomiaonyaw")
 
+    def test_promote_twstalker_subdomain(self) -> None:
+        url, title = promote_mirror(
+            "https://site.twstalker.com/www_wdzzsa",
+            "白武男.帝者战神@www_wdzzsa - Twitter Profile | TwStalker",
+        )
+        self.assertEqual(url, "https://x.com/www_wdzzsa")
+        self.assertEqual(title, "白武男.帝者战神@www_wdzzsa")
+
     def test_non_sotwe_untouched(self) -> None:
-        url, title = promote_sotwe("https://x.com/a/status/1", "标题")
+        url, title = promote_mirror("https://x.com/a/status/1", "标题")
         self.assertEqual((url, title), ("https://x.com/a/status/1", "标题"))
 
 

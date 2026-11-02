@@ -8,7 +8,10 @@ from __future__ import annotations
 import re
 from urllib.parse import unquote, urlparse
 
-SOTWE_URL_RE = re.compile(r"^https?://(?:www\.)?sotwe\.com/([A-Za-z0-9_]+)", re.I)
+MIRROR_URL_RE = re.compile(
+    r"^https?://(?:[A-Za-z0-9-]+\.)*(?:sotwe\.com|twstalker\.com|twstalker\.org)/([A-Za-z0-9_]+)",
+    re.I,
+)
 X_STATUS_RE = re.compile(r"^https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{2,20})(?:/status/|/?)", re.I)
 HANDLE_RE = re.compile(r"@([A-Za-z0-9_]{2,20})")
 SOTWE_TITLE_SUFFIX_RE = re.compile(r"\s*[-–—]\s*(?:Twitter|X).*$", re.I)
@@ -19,6 +22,7 @@ WEIBO_UID_RE = re.compile(r"weibo\.(?:com|cn)/(?:u/)?(\d{5,})")
 
 HIGH_VALUE_HOSTS = (
     "sotwe.com",
+    "twstalker.com",
     "twitter.com",
     "x.com",
     "instagram.com",
@@ -36,12 +40,14 @@ HIGH_VALUE_HOSTS = (
 LOW_VALUE_HOSTS = ("pinterest.", "google.", "bing.", "gstatic.")
 
 
-def promote_sotwe(url: str, title: str = "") -> tuple[str, str]:
-    """把 sotwe 镜像链接还原成 x.com 主页，并校正标题。
+def promote_mirror(url: str, title: str = "") -> tuple[str, str]:
+    """把 sotwe / TwStalker 这类 X 镜像链接还原成 x.com 主页，并校正标题。
 
-    返回 (url, title)。标题里的 @handle 比 sotwe 路径可靠，路径有时会多带下划线。
+    返回 (url, title)。标题里的 @handle 比镜像路径可靠，路径有时会多带下划线。
+    Google 抓不到 x.com，Lens 命中 X 上的图时给回来的往往是这些镜像页，
+    还原成主页用户才有得点。
     """
-    match = SOTWE_URL_RE.match(url or "")
+    match = MIRROR_URL_RE.match(url or "")
     if not match:
         return url, title
     cleaned = SOTWE_TITLE_SUFFIX_RE.sub("", title or "").strip()
@@ -73,6 +79,7 @@ _SOCIAL_HOSTS = (
     "twitter.com",
     "twimg.com",
     "sotwe.com",
+    "twstalker.com",
     "weibo.com",
     "weibo.cn",
     "xiaohongshu.com",

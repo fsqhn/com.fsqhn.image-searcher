@@ -21,7 +21,7 @@ from .extract import (
     clean_url,
     extract_identity,
     platform_of,
-    promote_sotwe,
+    promote_mirror,
     relevance_rank,
 )
 from .httpclient import (
@@ -173,7 +173,7 @@ class LensEngine:
                     continue
                 title = str(match.get("title") or "")
                 image = str(match.get("image") or "")
-                link, title = promote_sotwe(link, title)
+                link, title = promote_mirror(link, title)
                 items.append(
                     Candidate(
                         engine=self.name,
@@ -283,7 +283,7 @@ def to_yandex_candidate(site: dict, engine: str) -> Candidate:
     thumb = str((site.get("thumb") or {}).get("url") or "")
     if thumb.startswith("//"):
         thumb = "https:" + thumb
-    url, title = promote_sotwe(url, title)
+    url, title = promote_mirror(url, title)
     return Candidate(
         engine=engine,
         url=url,
