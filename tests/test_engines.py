@@ -158,6 +158,35 @@ class LensRetryTest(unittest.TestCase):
         self.assertEqual(self._engine(fake).search(b"img"), [])
         self.assertEqual(len(calls), 3)
 
+    def test_retries_after_engine_error(self) -> None:
+        """上传失败也要重试，别让一次抖动整轮丢掉 Lens。"""
+        from core.engines import EngineError
+
+        calls: list[int] = []
+
+        def fake(raw: bytes, image_url: str = "") -> list[Candidate]:
+            calls.append(1)
+            if len(calls) == 1:
+                raise EngineError("图片上传失败")
+            return [Candidate(engine="lens", url="https://x.com/foo/status/1")]
+
+        items = self._engine(fake).search(b"img")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(len(calls), 2)
+
+    def test_raises_when_all_attempts_fail(self) -> None:
+        from core.engines import EngineError
+
+        calls: list[int] = []
+
+        def fake(raw: bytes, image_url: str = "") -> list[Candidate]:
+            calls.append(1)
+            raise EngineError("图片上传失败")
+
+        with self.assertRaises(EngineError):
+            self._engine(fake).search(b"img")
+        self.assertEqual(len(calls), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

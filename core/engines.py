@@ -115,19 +115,27 @@ class LensEngine:
         self.retry_delay = max(0.0, float(retry_delay))
 
     def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
-        """空返回时换一次上传重试。
+        """空返回或上传失败时换一次上传重试。
 
-        SerpAPI 的 google_lens 对同一张图会随机返回 0 条（实测 6 次里有 3 次为空，
-        命中时却恰好是同图原帖），所以空结果不能直接当成「网上没有这张图」。
-        有结果就立刻返回，不额外消耗额度。
+        SerpAPI 的 google_lens 有两种失败都不代表「网上没有这张图」：
+        一是同一张图随机返回 0 条（实测 6 次里 3 次为空，命中时恰好是同图原帖），
+        二是图片上传接口偶发失败。两种都重试，有结果就立刻返回。
         """
         items: list[Candidate] = []
+        last_error: EngineError | None = None
         for attempt in range(self.retries + 1):
-            items = self._search_once(raw, image_url)
+            try:
+                items = self._search_once(raw, image_url)
+                last_error = None
+            except EngineError as exc:
+                items = []
+                last_error = exc
             if items:
                 return items
             if attempt < self.retries:
                 time.sleep(self.retry_delay)
+        if last_error is not None:
+            raise last_error
         return items
 
     def _search_once(self, raw: bytes, image_url: str = "") -> list[Candidate]:
