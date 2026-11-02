@@ -127,6 +127,26 @@ class LensConfig(EngineConfig):
         ge=1,
         le=20,
     )
+    retries: int = Field(
+        default=2,
+        description=(
+            "Lens 返回 0 条时的重试次数。同一张图它会有大约一半概率随机返回空结果，"
+            "而空结果并不代表网上没有这张图，重试往往就能拿到原帖。"
+        ),
+        json_schema_extra=_ui(
+            "空结果重试次数",
+            "建议 2。只在返回 0 条时才重试，有结果就停，不会白白多花额度。",
+        ),
+        ge=0,
+        le=5,
+    )
+    retry_delay: float = Field(
+        default=1.5,
+        description="Lens 每次重试之间等待的秒数。",
+        json_schema_extra=_ui("重试间隔（秒）", "建议 1.5。"),
+        ge=0,
+        le=10,
+    )
 
 
 class YandexConfig(EngineConfig):
@@ -764,7 +784,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "ai": KeyPool(config.ai_detect.keys),
         }
         self._engines = {
-            "lens": LensEngine(self._pools["lens"], global_proxy, section.engine_timeout),
+            "lens": LensEngine(
+                self._pools["lens"],
+                global_proxy,
+                section.engine_timeout,
+                config.lens.retries,
+                config.lens.retry_delay,
+            ),
             "yandex": YandexEngine(global_proxy, section.engine_timeout),
             "baidu": BaiduEngine(global_proxy, section.engine_timeout),
             "saucenao": SauceNaoEngine(

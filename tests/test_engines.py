@@ -8,7 +8,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.engines import Candidate, to_yandex_candidate, verify_candidate  # noqa: E402
+from core.engines import (  # noqa: E402
+    Candidate,
+    LensEngine,
+    to_yandex_candidate,
+    verify_candidate,
+)
 
 
 class YandexCandidateTest(unittest.TestCase):
@@ -107,6 +112,51 @@ class VerifyFallbackTest(unittest.TestCase):
 
         self.assertEqual(result.status, "unverified")
         self.assertIn("下载失败", result.note)
+
+
+class LensRetryTest(unittest.TestCase):
+    """Lens 对同一张图会随机返回 0 条，空返回必须重试，有结果就立刻停。"""
+
+    def _engine(self, fake, retries: int = 2):
+        from core.keypool import KeyPool
+
+        engine = LensEngine(KeyPool(["k"]), retries=retries, retry_delay=0)
+        engine._search_once = fake
+        return engine
+
+    def test_retries_until_non_empty(self) -> None:
+        calls: list[int] = []
+
+        def fake(raw: bytes, image_url: str = "") -> list[Candidate]:
+            calls.append(1)
+            if len(calls) < 3:
+                return []
+            return [Candidate(engine="lens", url="https://x.com/foo/status/1")]
+
+        items = self._engine(fake).search(b"img")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(len(calls), 3)
+
+    def test_stops_on_first_non_empty(self) -> None:
+        calls: list[int] = []
+
+        def fake(raw: bytes, image_url: str = "") -> list[Candidate]:
+            calls.append(1)
+            return [Candidate(engine="lens", url="https://x.com/foo/status/1")]
+
+        items = self._engine(fake, retries=3).search(b"img")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_gives_up_after_retries(self) -> None:
+        calls: list[int] = []
+
+        def fake(raw: bytes, image_url: str = "") -> list[Candidate]:
+            calls.append(1)
+            return []
+
+        self.assertEqual(self._engine(fake).search(b"img"), [])
+        self.assertEqual(len(calls), 3)
 
 
 if __name__ == "__main__":

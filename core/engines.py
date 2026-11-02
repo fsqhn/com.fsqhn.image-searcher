@@ -10,6 +10,7 @@ from __future__ import annotations
 import html as html_lib
 import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -99,12 +100,37 @@ class LensEngine:
 
     name = "lens"
 
-    def __init__(self, pool: KeyPool, proxy: str = "", timeout: float = 40.0) -> None:
+    def __init__(
+        self,
+        pool: KeyPool,
+        proxy: str = "",
+        timeout: float = 40.0,
+        retries: int = 2,
+        retry_delay: float = 1.5,
+    ) -> None:
         self.pool = pool
         self.proxy = proxy
         self.timeout = timeout
+        self.retries = max(0, int(retries))
+        self.retry_delay = max(0.0, float(retry_delay))
 
     def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
+        """空返回时换一次上传重试。
+
+        SerpAPI 的 google_lens 对同一张图会随机返回 0 条（实测 6 次里有 3 次为空，
+        命中时却恰好是同图原帖），所以空结果不能直接当成「网上没有这张图」。
+        有结果就立刻返回，不额外消耗额度。
+        """
+        items: list[Candidate] = []
+        for attempt in range(self.retries + 1):
+            items = self._search_once(raw, image_url)
+            if items:
+                return items
+            if attempt < self.retries:
+                time.sleep(self.retry_delay)
+        return items
+
+    def _search_once(self, raw: bytes, image_url: str = "") -> list[Candidate]:
         key = self.pool.acquire()
         if not key:
             raise EngineError("没有可用的 SerpAPI key（未配置或全部冷却）")

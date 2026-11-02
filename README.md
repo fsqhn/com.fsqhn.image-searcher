@@ -111,6 +111,10 @@ keys = ["你的 SerpAPI key"]
 
 国内直连 `serpapi.com` 基本不通，**必须先配好代理**（见下面[代理](#代理很重要建议先配好)）。
 
+Lens 有个已知的怪脾气：**同一张图会随机返回 0 条**。实测把同一张图连着请求 6 次，3 次拿到原帖、3 次是空的，而空的那几次并不是网上没有这张图。所以插件默认在返回 0 条时重开一次上传重试，默认重试 2 次（`retries`），间隔 1.5 秒（`retry_delay`）。有结果就立刻停，不额外消耗额度；只有真的一张都对不上时才会多花这几次调用。
+
+如果你发现某个引擎「明明该搜到却没有」，先看它是不是返回 0 条——把 `retries` 调到 3～4 能进一步降低漏判，代价是这种情况下多消耗几次额度。
+
 ### SauceNAO
 
 1. 打开 https://saucenao.com/user.php 注册账号。
@@ -213,7 +217,7 @@ proxy = "http://127.0.0.1:6789"
 | `proxy` | 空 | 唯一的代理设置，所有引擎、图片下载、AI 检测都走它；留空即直连，**强烈建议填写** |
 | `max_concurrent_tasks` | 3 | 同时进行的搜索数上限 |
 
-四个引擎各自独立成段：`[lens]`、`[yandex]`、`[baidu]`、`[saucenao]`，每段都有 `enabled` / `keys` / `max_results`，`[saucenao]` 额外有 `min_similarity` / `route_similarity` 和五个库策略字段：
+四个引擎各自独立成段：`[lens]`、`[yandex]`、`[baidu]`、`[saucenao]`，每段都有 `enabled` / `keys` / `max_results`；`[lens]` 额外有 `retries` / `retry_delay`（空返回重试），`[saucenao]` 额外有 `min_similarity` / `route_similarity` 和五个库策略字段：
 
 | `[saucenao]` 字段 | 默认 | 说明 |
 |---|---|---|
