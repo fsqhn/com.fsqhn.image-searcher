@@ -32,6 +32,12 @@ class SearchOutcome:
     total_candidates: int = 0
     image_b64: str = ""
     image_source: str = ""
+    # 视觉兜底的执行情况：{"ok", "checked", "picked": [候选图地址], "reason", "model", "error"}。
+    # 只在指纹一条都没命中时才有值，落盘保留，重放时也能说清当时复核了什么。
+    vision: dict | None = None
+    # Grok 兜底：{"ok", "tier", "handle", "post_url", "reason", "model", "tools", "error"}。
+    # tier 为 post 表示拿到具体帖子，account 表示只拿到账号主页。
+    grok: dict | None = None
     # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
     images: dict[str, str] = field(default_factory=dict)
 
@@ -49,6 +55,8 @@ class SearchOutcome:
             "elapsed_ms": self.elapsed_ms,
             "total_candidates": self.total_candidates,
             "image_source": self.image_source,
+            "vision": self.vision,
+            "grok": self.grok,
         }
 
 
@@ -120,8 +128,11 @@ class TaskStore:
             alive = {task_id for task_id in self._tasks}
             self._latest = {key: value for key, value in self._latest.items() if value in alive}
 
-    def _evict(self, keep: int = 50) -> None:
-        """任务里可能持有 1MB+ 的图片 base64，给内存留个硬上限。"""
+    def _evict(self, keep: int = 80) -> None:
+        """任务里可能持有 1MB+ 的图片 base64，给内存留个硬上限。
+
+        保留时长默认 1 天，条数上限跟着放宽到 80；再往上就要考虑内存了。
+        """
         if len(self._tasks) <= keep:
             return
         finished = [task for task in self._tasks.values() if task.status != "running"]
@@ -167,7 +178,7 @@ class TaskStore:
     def _persist(self) -> None:
         """只保存最近的文字摘要，图片与二进制不落盘。"""
         snapshot: dict[str, dict] = {}
-        for task in sorted(self._tasks.values(), key=lambda item: item.created_at, reverse=True)[:30]:
+        for task in sorted(self._tasks.values(), key=lambda item: item.created_at, reverse=True)[:60]:
             if task.status == "running" or task.outcome is None:
                 continue
             snapshot[task.task_id] = {
@@ -215,6 +226,8 @@ class TaskStore:
                     elapsed_ms=int(summary.get("elapsed_ms") or 0),
                     total_candidates=int(summary.get("total_candidates") or 0),
                     image_source=str(summary.get("image_source") or ""),
+                    vision=summary.get("vision"),
+                    grok=summary.get("grok"),
                 )
                 task = SearchTask(
                     task_id=task_id,

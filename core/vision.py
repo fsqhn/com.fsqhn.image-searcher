@@ -1,0 +1,284 @@
+"""视觉兜底：把目标图和候选图拼成一张网格，交给 MaiBot 的视觉模型挑「同一个人」。
+
+dHash 比的是整图灰度结构，遇到拼接、裁剪、加字、换姿势就会失准：明明是同一
+套衣服同一个人，距离也能到 20 以上。这里换一个判据——人物身份是否一致，不
+要求同一张图。
+
+只在整轮没有任何 ``match`` 时启用，dHash 的主路逻辑不变。所以这里全部是纯
+函数：拼图、写 prompt、解析回复，方便单测，不碰网络也不碰插件上下文。
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import re
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+from .extract import is_social_platform
+
+GRID_COLS = 5
+CELL_SIZE = 224
+GAP = 4
+BACKGROUND = (46, 46, 46)
+PLACEHOLDER = (86, 86, 86)
+JPEG_QUALITY = 82
+LABEL_SIZE = 22
+# 候选图可能是几千像素的原图，拼图时只留 224 的格子，没必要把整张大图留在内存里。
+# 服务器空闲内存只有几百 MB，这里比 hashing.MAX_PIXELS 更保守。
+MAX_SOURCE_PIXELS = 30_000_000
+
+PROMPT_TEMPLATE = """你在帮我核对「同一个人」。
+
+第 0 格是目标图，标着 TARGET；第 1 到第 {count} 格是搜索引擎返回的候选，每格左上角标着编号。
+
+请找出候选里哪些和 TARGET 是同一个人。判断依据是人本身：脸型、五官、发型、身材、气质，以及明显属于这个人的特征（同一套衣服、同一处纹身、同一个配饰）。
+同一个人换了姿势、换了角度、被裁掉一部分、被别人拼成对比图、加上水印或滤镜、换了背景，都算同一个人。
+反过来要排除：同一个角色、同一套 cos 服，但明显是另一个人的，不算同一个人。
+特别注意：电商商品图、模特展示图、商品详情页截图，即使衣服鞋子一模一样，也不算同一个人——那只是同款商品，不是同一个人。
+拿不准的不要选，宁缺毋滥。
+
+只输出一行 JSON，不要任何解释与代码块：
+{{"same_person": [编号], "reason": "不超过 30 字的判断依据"}}
+一个都不是就输出：
+{{"same_person": [], "reason": "..."}}
+"""
+
+_JSON_BLOCK = re.compile(r"\{.*\}", re.S)
+_ARRAY_FIELD = re.compile(r"(?:same_person|picks|same|indices)['\"]?\s*[:：]\s*\[([^\]]*)\]")
+_INT = re.compile(r"\d+")
+_FENCE = re.compile(r"```[a-zA-Z]*")
+
+
+@dataclass
+class Grid:
+    """拼好的对照图。
+
+    格子编号从 0 开始：0 号是目标图，第 n 号对应候选列表的第 n-1 项。解析
+    回复时按这个偏移反查是哪一条候选。
+    """
+
+    data: bytes
+    width: int = 0
+    height: int = 0
+
+    @property
+    def data_url(self) -> str:
+        return "data:image/jpeg;base64," + base64.b64encode(self.data).decode("ascii")
+
+
+def build_prompt(count: int) -> str:
+    """count 是候选格数（不含目标图）。"""
+    return PROMPT_TEMPLATE.format(count=count)
+
+
+# 电商/商品页域名。视觉模型看「同款格裙、黑丝、小皮鞋」很容易把卖同款衣服的
+# 商品图当成同一个人，实测一次命中 3 条全是速卖通的连裤袜商品页。这类结果只
+# 能当参考，不能进结论。
+COMMERCE_TOKENS = (
+    "aliexpress",
+    "alibaba",
+    "taobao",
+    "tmall",
+    "jd.com",
+    "1688",
+    "pinduoduo",
+    "amazon",
+    "ebay",
+    "etsy",
+    "shein",
+    "temu",
+    "rakuten",
+    "mercari",
+    "shopee",
+    "lazada",
+    "walmart",
+    "ozon",
+    "wildberries",
+    "dhgate",
+    "banggood",
+    "cjdropshipping",
+    "redbubble",
+    "teespring",
+)
+
+
+def _hosts_of(text: str) -> list[str]:
+    value = str(text or "").strip().lower()
+    if not value:
+        return []
+    host = urlparse(value).netloc if "://" in value else value
+    host = host.rsplit("@", 1)[-1].split(":")[0]
+    return [host] if host else []
+
+
+def is_commerce(platform: str = "", url: str = "", name: str = "") -> bool:
+    """是不是电商商品页。平台名、链接、标题任意一处命中就算。"""
+    for raw in (url, platform):
+        for host in _hosts_of(raw):
+            if any(token in host for token in COMMERCE_TOKENS):
+                return True
+    title = str(name or "").lower()
+    return bool(title) and any(token in title for token in COMMERCE_TOKENS)
+
+
+def is_traceable(handle: str = "", platform: str = "", url: str = "") -> bool:
+    """能不能顺着这条结果找到人：有账号名，或者落在社交/画师站上。"""
+    if str(handle or "").strip():
+        return True
+    return is_social_platform(url=url, source=platform)
+
+
+
+def _font(size: int = LABEL_SIZE):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # Pillow < 10.1 不支持 size 参数
+        return ImageFont.load_default()
+
+
+def _decode(raw: bytes | None) -> Image.Image | None:
+    if not raw:
+        return None
+    try:
+        image = Image.open(io.BytesIO(raw))
+        if image.width * image.height > MAX_SOURCE_PIXELS:
+            return None
+        image = ImageOps.exif_transpose(image)
+        return image.convert("RGB")
+    except Exception:  # noqa: BLE001 - 解不开的图留灰块，不能中断整张拼图
+        return None
+
+
+def _fit(image: Image.Image, cell: int) -> Image.Image:
+    """等比缩到格子里，剩下的边留背景色，避免人脸被拉扁。
+
+    传进来的图是刚解码出来的独占对象，直接原地改，不额外复制一份。
+    """
+    image.thumbnail((cell, cell), Image.LANCZOS)
+    canvas = Image.new("RGB", (cell, cell), BACKGROUND)
+    canvas.paste(image, ((cell - image.width) // 2, (cell - image.height) // 2))
+    return canvas
+
+
+def _label(draw: ImageDraw.ImageDraw, x: int, y: int, text: str, font) -> None:
+    """白底黑字，贴在同一位置，浅色图和深色图上都能看清。"""
+    box = draw.textbbox((0, 0), text, font=font)
+    width = box[2] - box[0] + 10
+    height = box[3] - box[1] + 8
+    draw.rectangle((x, y, x + width, y + height), fill=(255, 255, 255))
+    draw.text((x + 5, y + 4 - box[1]), text, font=font, fill=(0, 0, 0))
+
+
+def build_grid(
+    target: bytes | None,
+    candidates: list[bytes],
+    *,
+    cols: int = GRID_COLS,
+    cell: int = CELL_SIZE,
+) -> Grid:
+    """目标图放 0 号格，候选从 1 号开始按传入顺序铺开。
+
+    逐张解码、缩放、贴进画布，处理完就丢，不在内存里同时留几十张原图——服务器
+    内存本来就紧。图解码失败时留灰块但编号照旧，这样格子编号和候选列表始终
+    一一对应，模型报哪一格都能反查到具体候选。
+    """
+    sources: list[bytes | None] = [target, *candidates]
+    if len(sources) < 2:
+        raise ValueError("拼图至少需要目标图和一张候选")
+
+    columns = max(2, min(int(cols), len(sources)))
+    cell = max(96, int(cell))
+    rows = (len(sources) + columns - 1) // columns
+    width = columns * cell + (columns + 1) * GAP
+    height = rows * cell + (rows + 1) * GAP
+
+    canvas = Image.new("RGB", (width, height), BACKGROUND)
+    draw = ImageDraw.Draw(canvas)
+    font = _font()
+
+    for index, raw in enumerate(sources):
+        row, column = divmod(index, columns)
+        x = GAP + column * (cell + GAP)
+        y = GAP + row * (cell + GAP)
+        image = _decode(raw)
+        tile = _fit(image, cell) if image is not None else Image.new("RGB", (cell, cell), PLACEHOLDER)
+        canvas.paste(tile, (x, y))
+        _label(draw, x + 4, y + 4, "TARGET" if index == 0 else str(index), font)
+
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    return Grid(data=buffer.getvalue(), width=width, height=height)
+
+
+def parse_picks(text: str, max_index: int) -> list[int]:
+    """从模型回复里取出「同一个人」的格子编号，越界和 0 号一律丢掉。
+
+    模型偶尔会套 markdown 代码块、用单引号、或者只回一个 ``[3]``，所以先按
+    标准 JSON 解，失败再退回正则抠 ``same_person`` 后面的数组。
+    """
+    if not text or max_index < 1:
+        return []
+
+    cleaned = _FENCE.sub("", text).strip()
+    payload = None
+    match = _JSON_BLOCK.search(cleaned)
+    if match:
+        try:
+            payload = json.loads(match.group(0))
+        except Exception:  # noqa: BLE001 - 交给下面的正则兜底
+            payload = None
+
+    numbers: list[int] = []
+    if isinstance(payload, dict):
+        values = payload.get("same_person")
+        if values is None:
+            for key in ("picks", "same", "indices", "matches"):
+                if key in payload:
+                    values = payload[key]
+                    break
+        numbers = _to_numbers(values)
+    elif isinstance(payload, list):
+        numbers = _to_numbers(payload)
+
+    if not numbers:
+        loose = _ARRAY_FIELD.search(cleaned)
+        if loose:
+            numbers = [int(item) for item in _INT.findall(loose.group(1))]
+
+    picked: list[int] = []
+    for number in numbers:
+        if 1 <= number <= max_index and number not in picked:
+            picked.append(number)
+    return picked
+
+
+def _to_numbers(values: object) -> list[int]:
+    if isinstance(values, (int, float)):
+        return [int(values)]
+    if isinstance(values, str):
+        return [int(item) for item in _INT.findall(values)]
+    if isinstance(values, (list, tuple, set)):
+        numbers: list[int] = []
+        for item in values:
+            numbers.extend(_to_numbers(item))
+        return numbers
+    return []
+
+
+def reason_of(text: str) -> str:
+    """取模型给的一句理由，只用于日志和备注，失败就返回空串。"""
+    match = _JSON_BLOCK.search(_FENCE.sub("", text or ""))
+    if not match:
+        return ""
+    try:
+        payload = json.loads(match.group(0))
+    except Exception:  # noqa: BLE001
+        return ""
+    if isinstance(payload, dict):
+        return str(payload.get("reason") or "").strip()[:60]
+    return ""

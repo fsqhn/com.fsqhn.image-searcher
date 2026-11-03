@@ -11,6 +11,7 @@ from core.formatting import (
     build_text_summary,
     engine_groups,
     stale_image_hint,
+    ttl_text,
 )
 from core.tasks import SearchOutcome, SearchTask
 
@@ -77,7 +78,7 @@ class ForwardNodesTest(unittest.TestCase):
         )
         self.assertIn("参考图", joined)
 
-    def _grouped_outcome(self) -> SearchOutcome:
+    def _grouped_outcome(self, *, hit: bool = True) -> SearchOutcome:
         best = Candidate(
             engine="saucenao",
             url="https://www.pixiv.net/artworks/9",
@@ -108,16 +109,16 @@ class ForwardNodesTest(unittest.TestCase):
         for item in (best, lens_a, lens_b, yandex_a):
             item.finalize()
         return SearchOutcome(
-            status="ok",
-            best=best,
+            status="ok" if hit else "not_found",
+            best=best if hit else None,
             candidates=[lens_a, lens_b, yandex_a, best],
             image_b64="BEST",
             image_source=best.image_url,
         )
 
     def test_reference_is_grouped_by_engine(self) -> None:
-        """参考区按引擎分开，每个引擎一个节点，标题带引擎名和条数。"""
-        nodes = build_forward_nodes(_task(self._grouped_outcome()), command="麦麦寻人")
+        """没找到时的参考区按引擎分开，每个引擎一个节点，标题带引擎名和条数。"""
+        nodes = build_forward_nodes(_task(self._grouped_outcome(hit=False)), command="麦麦寻人")
         text = "\n".join(
             part.get("content", "")
             for node in nodes
@@ -129,15 +130,49 @@ class ForwardNodesTest(unittest.TestCase):
         # 最佳匹配那一条不重复出现在参考区
         self.assertEqual(text.count("artworks/9"), 1)
 
+    def test_hit_hides_reference(self) -> None:
+        """命中时首次回复只给结论，参考区留给「更多」。"""
+        nodes = build_forward_nodes(_task(self._grouped_outcome()), command="麦麦寻人")
+        text = "\n".join(
+            part.get("content", "")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertNotIn("▍Google Lens", text)
+        self.assertNotIn("▍Yandex", text)
+        self.assertIn("pixiv.net/artworks/9", text)
+
+    def test_footer_carries_task_id(self) -> None:
+        """首次回复要给出任务编号，用户靠它回「更多」定位到具体那一次。"""
+        task = _task(self._grouped_outcome())
+        nodes = build_forward_nodes(task, command="麦麦寻人", ttl_minutes=1440)
+        text = "\n".join(
+            part.get("content", "")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn(task.task_id, text)
+        self.assertIn("1 天", text)
+        self.assertIn("更多", text)
+
+    def test_ttl_text_reads_in_human_units(self) -> None:
+        self.assertEqual(ttl_text(15), "15 分钟")
+        self.assertEqual(ttl_text(60), "1 小时")
+        self.assertEqual(ttl_text(90), "1.5 小时")
+        self.assertEqual(ttl_text(1440), "1 天")
+        self.assertEqual(ttl_text(2880), "2 天")
+
     def test_first_reply_carries_one_image_per_engine(self) -> None:
-        """首次回复：每个引擎最接近的那张带图，其余候选只列文字。"""
-        outcome = self._grouped_outcome()
+        """没找到时首次回复：每个引擎最接近的那张带图，其余候选只列文字。"""
+        outcome = self._grouped_outcome(hit=False)
         outcome.images = {"https://img.example/1.jpg": "LENS1", "https://img.example/3.jpg": "YANDEX1"}
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人")
-        self.assertEqual(_images(nodes), [(1, "BEST"), (2, "LENS1"), (3, "YANDEX1")])
+        self.assertEqual(_images(nodes), [(2, "BEST"), (3, "LENS1"), (4, "YANDEX1")])
 
     def test_more_reply_carries_every_candidate_image(self) -> None:
-        outcome = self._grouped_outcome()
+        outcome = self._grouped_outcome(hit=False)
         outcome.images = {
             "https://img.example/1.jpg": "LENS1",
             "https://img.example/2.jpg": "LENS2",
@@ -146,11 +181,11 @@ class ForwardNodesTest(unittest.TestCase):
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", limit=10, replay=True)
         self.assertEqual(
             _images(nodes),
-            [(1, "BEST"), (2, "LENS1"), (2, "LENS2"), (3, "YANDEX1")],
+            [(2, "BEST"), (3, "LENS1"), (3, "LENS2"), (4, "YANDEX1")],
         )
 
     def test_engine_limit_caps_candidates_per_engine(self) -> None:
-        nodes = build_forward_nodes(_task(self._grouped_outcome()), command="麦麦寻人", limit=1)
+        nodes = build_forward_nodes(_task(self._grouped_outcome(hit=False)), command="麦麦寻人", limit=1)
         text = "\n".join(
             part.get("content", "")
             for node in nodes
@@ -173,7 +208,7 @@ class ForwardNodesTest(unittest.TestCase):
 
     def test_engine_group_sorted_by_distance(self) -> None:
         """组内按指纹距离从近到远排，第一条就是该引擎最接近的那张。"""
-        outcome = self._grouped_outcome()
+        outcome = self._grouped_outcome(hit=False)
         lens_one = next(item for item in outcome.candidates if item.url.endswith("/1"))
         lens_two = next(item for item in outcome.candidates if item.url.endswith("/2"))
         lens_one.distance, lens_two.distance = 15, 6
@@ -249,7 +284,7 @@ class CandidateAccountTest(unittest.TestCase):
             note="插画路线参考，未做指纹比对",
         )
         item.finalize()
-        outcome = SearchOutcome(status="ok", best=None, candidates=[item])
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[item])
         text = build_text_summary(_task(outcome), command="麦麦寻人")
         self.assertIn("账号未确认", text)
         self.assertNotIn("@someone", text)

@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.config import build_plugin_default_config, merge_plugin_config_data
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
-from .core import formatting
+from .core import formatting, grok, vision
 from .core.commands import build_command_pattern, build_more_pattern
+from .core.config import migrate_legacy_sections
 from .core.engines import (
     BaiduEngine,
     Candidate,
@@ -31,7 +33,7 @@ from .core.engines import (
 )
 from .core.extract import is_pixiv_platform, is_social_platform, is_x_platform
 from .core.hashing import dhash, prepare_upload
-from .core.httpclient import HttpError, download_image_multi
+from .core.httpclient import HttpError, download_image_multi, make_session
 from .core.keypool import KeyPool
 from .core.maibot_compat import unwrap_capability
 from .core.tasks import SearchOutcome, SearchTask, TaskStore
@@ -273,6 +275,7 @@ class AiDetectConfig(PluginConfigBase):
     """AI 生成图检测配置。"""
 
     __ui_label__ = "AI 图检测"
+    __ui_order__ = 8
 
     enabled: bool = Field(
         default=False,
@@ -288,6 +291,106 @@ class AiDetectConfig(PluginConfigBase):
         default=True,
         description="只在没有可靠匹配时才调用检测，避免每次搜图都消耗 Sightengine 额度。",
         json_schema_extra=_ui("仅在没找到匹配时检测", "建议保持开启。"),
+    )
+
+
+class VisionConfig(PluginConfigBase):
+    """视觉复核：指纹全灭时，把目标图和候选拼成对照图，让视觉模型找「同一个人」。"""
+
+    __ui_label__ = "视觉复核（拼图交给视觉模型）"
+    __ui_icon__ = "eye"
+    __ui_order__ = 6
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "视觉兜底：指纹一条都没通过时，把目标图和最接近的候选拼成一张对照图，"
+            "交给 MaiBot 的视觉模型判断有没有「同一个人」。只找同一个人，不要求同一张图。"
+        ),
+        json_schema_extra=_ui(
+            "启用视觉复核",
+            "默认开。只在整轮没有任何匹配时触发，指纹判定不受影响；关掉后搜不到就直接报没找到。",
+        ),
+    )
+    top_n: int = Field(
+        default=16,
+        description="视觉复核时拼前几张候选。16 张是 4 行 5 列，25 张是 5 行 5 列。格数越多越慢、越容易看错。",
+        json_schema_extra=_ui("拼几张候选", "默认 16。拼 25 张更全，但小图更难分辨，也更费时间。"),
+        ge=4,
+        le=25,
+    )
+    task: str = Field(
+        default="vlm",
+        description="用哪个模型任务做视觉复核。MaiBot 的模型配置里有专门的视觉任务组，默认值就是它。",
+        json_schema_extra=_ui("模型任务名", "默认 vlm。只有改过模型任务名才需要动这里。", placeholder="vlm"),
+    )
+    model: str = Field(
+        default="",
+        description=(
+            "具体用哪个视觉模型。留空表示按上面的任务组顺序挑，一般不需要填；"
+            "只有任务组里排在前面的模型不好用（比如推理型会把输出额度花在思考上、正文被截断）时才点名。"
+        ),
+        json_schema_extra=_ui(
+            "指定模型（留空即可）",
+            "留空就用任务组里的模型。填了就强制走这个名字，写错会导致调用失败。",
+            placeholder="留空按任务组顺序",
+        ),
+    )
+    timeout: int = Field(
+        default=90,
+        description="一次视觉复核最多等多少秒，超时就放弃，不影响已经搜到的文字结果。",
+        json_schema_extra=_ui("超时（秒）", "默认 90。图片多、模型慢时可以调大。"),
+        ge=10,
+        le=300,
+    )
+
+
+class GrokConfig(PluginConfigBase):
+    """Grok 兜底：指纹全灭时，带图去 X 上核对候选账号或找原帖。"""
+
+    __ui_label__ = "Grok 兜底（X 上找发布者）"
+    __ui_icon__ = "sparkles"
+    __ui_order__ = 7
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "指纹一条都没通过时，把原图和已有候选一起交给 Grok，让它在 X 上核对哪个账号是发布者。"
+            "给出具体帖子链接算找到，只给出账号主页算线索。需要填 API Key。"
+        ),
+        json_schema_extra=_ui(
+            "启用 Grok 找人",
+            "默认关。要填 API Key 才会真的发请求；按次计费。和视觉复核同时跑。",
+        ),
+    )
+    base_url: str = Field(
+        default="",
+        description="兼容 OpenAI Responses 接口、支持 x_search 工具的 API 地址，例如 https://api.x.ai/v1。",
+        json_schema_extra=_ui(
+            "Base URL",
+            "填服务地址，例如 https://api.x.ai/v1。不要带末尾斜杠。",
+            placeholder="https://api.x.ai/v1",
+        ),
+    )
+    api_key: str = Field(
+        default="",
+        description="上面那个服务地址的 API Key。留空时即使打开开关也不会发出请求。",
+        json_schema_extra=_ui("API Key", "只写在本机 config.toml，不会上传。留空表示不用这个功能。"),
+    )
+    model: str = Field(
+        default="grok-4.7",
+        description="用哪个模型。填服务商实际提供的名字，需要支持图输入和 x_search。",
+        json_schema_extra=_ui("模型", "以服务商提供的模型名为准，默认 grok-4.7。", placeholder="grok-4.7"),
+    )
+    timeout: int = Field(
+        default=120,
+        description=(
+            "找人最多等多少秒。实测顺利时约 48 秒，但服务端会抖动，出现过 70 秒无响应；"
+            "120 秒留足余量，超时就放弃，视觉结果照常返回。"
+        ),
+        json_schema_extra=_ui("超时（秒）", "默认 120。抖动时一次可能跑满，嫌久可以调回 70。"),
+        ge=15,
+        le=300,
     )
 
 
@@ -324,11 +427,17 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra=_ui("转发昵称", "随便改，只影响显示。"),
     )
     task_ttl_minutes: int = Field(
-        default=15,
-        description="搜完的结果保留多久。这段时间内回复「更多」可以直接重发，不用重新搜。",
-        json_schema_extra=_ui("结果保留时间（分钟）", "默认 15 分钟，超时后要重新发图。"),
+        default=1440,
+        description=(
+            "搜完的结果保留多久。这段时间内回复「更多 + 任务编号」可以直接重发，"
+            "不用重新搜。超过就清掉缓存，只能重新发图。"
+        ),
+        json_schema_extra=_ui(
+            "结果保留时长（分钟）",
+            "默认 1440，也就是 1 天。过期后缓存被清掉，回复「更多」会提示重新搜。",
+        ),
         ge=1,
-        le=1440,
+        le=10080,
     )
     show_reference: bool = Field(
         default=True,
@@ -494,6 +603,8 @@ class ImageSearcherConfig(PluginConfigBase):
     yandex: YandexConfig = Field(default_factory=YandexConfig)
     baidu: BaiduConfig = Field(default_factory=BaiduConfig)
     saucenao: SauceNaoConfig = Field(default_factory=SauceNaoConfig)
+    vision: VisionConfig = Field(default_factory=VisionConfig)
+    grok: GrokConfig = Field(default_factory=GrokConfig)
     ai_detect: AiDetectConfig = Field(default_factory=AiDetectConfig)
 
 
@@ -712,6 +823,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
             self.ctx.logger.info(message, *args)
         else:
             self.ctx.logger.debug(message, *args)
+
+    # -- 配置兼容 ---------------------------------------------------------
+
+    def normalize_plugin_config(self, config_data: dict[str, Any] | None) -> tuple[dict[str, Any], bool]:
+        """迁移老字段，并按模型补齐所有配置节。
+
+        补齐是给 WebUI 用的：配置页只拿到归一化结果，缺节就渲染不出那一栏。
+        """
+        migrated, moved = migrate_legacy_sections(config_data)
+        merged, filled = merge_plugin_config_data(build_plugin_default_config(ImageSearcherConfig), migrated)
+        return merged, moved or filled
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -1178,6 +1300,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         outcome = task.outcome
         if outcome is None or not outcome.candidates:
             return
+        if outcome.status == "ok" and not whole:
+            # 命中时首次回复只有结论，参考区要等「更多」，不必提前下载这些配图。
+            return
         targets: list[str] = []
         for engine, items in formatting.engine_groups(outcome, outcome.best, limit):
             if not whole and outcome.best is not None and engine == outcome.best.engine:
@@ -1292,11 +1417,47 @@ class ImageSearcherPlugin(MaiBotPlugin):
         # 最佳匹配按指纹质量挑，不受引擎顺序影响；指纹距离优先，其次相似度。
         # 插画路线优先取 pixiv 的命中。
         best = self._pick_best(ordered, prefer_pixiv=sauce is not None)
+
+        # 指纹一条都没通过时才做兜底：视觉认「同一个人」，Grok 认「X 上的账号」，
+        # 两件都不是 dHash 能做的。并行发出，各自超时，谁有结果用谁。
+        # 插画路线不走这里：SauceNAO 的相似度已经能定论，没必要再让模型猜。
+        vision_info: dict[str, Any] | None = None
+        grok_info: dict[str, Any] | None = None
+        if best is None and sauce is None and upload:
+            jobs: dict[str, Any] = {}
+            if config.vision.enabled:
+                jobs["vision"] = self._vision_review(upload, ordered)
+            if config.grok.enabled and (config.grok.api_key or "").strip():
+                jobs["grok"] = self._grok_lookup(upload, ordered)
+            if jobs:
+                results = await asyncio.gather(*jobs.values(), return_exceptions=True)
+                for kind, result in zip(jobs, results):
+                    if isinstance(result, BaseException):
+                        # 兜底是加分项，任何一侧炸掉都不能影响已经搜到的文字结果。
+                        message = f"{kind} 兜底异常：{result}"
+                        errors.setdefault("fallback", message)
+                        self.ctx.logger.warning("搜图兜底失败：%s", message)
+                        continue
+                    if kind == "vision":
+                        vision_info = result
+                    else:
+                        grok_info = result
+                if vision_info and vision_info.get("picked"):
+                    ordered = self._rank(candidates, names)
+                    # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
+                    # 画面本来就更像，比编号顺序更靠谱。
+                    hits = [item for item in ordered if item.status == "vision"]
+                    best = min(
+                        hits,
+                        key=lambda item: (item.distance if item.distance is not None else 999, item.rank),
+                    )
+
         self._vlog(
-            "分流结果：路线=%s 原因=%s；匹配=%s 疑似=%s 不符=%s 未验证=%s",
+            "分流结果：路线=%s 原因=%s；匹配=%s 视觉=%s 疑似=%s 不符=%s 未验证=%s",
             route,
             route_reason,
             sum(1 for c in ordered if c.status == "match"),
+            sum(1 for c in ordered if c.status == "vision"),
             sum(1 for c in ordered if c.status == "suspect"),
             sum(1 for c in ordered if c.status == "mismatch"),
             sum(1 for c in ordered if c.status == "unverified"),
@@ -1317,8 +1478,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 section.engine_timeout,
             )
 
+        # Grok 给了具体帖子或账号，也算有结论：前者是找到，后者是线索。
+        grok_hit = bool(grok_info and grok_info.get("tier") in {"post", "account"})
         outcome = SearchOutcome(
-            status="ok" if best is not None else "not_found",
+            status="ok" if (best is not None or grok_hit) else "not_found",
             best=best,
             candidates=ordered,
             ai=ai,
@@ -1328,9 +1491,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
             engine_counts=engine_counts,
             elapsed_ms=int((time.time() - started) * 1000),
             total_candidates=total,
+            vision=vision_info,
+            grok=grok_info,
         )
 
-        if best is not None or ordered or upload:
+        if grok_hit and best is None and upload:
+            # Grok 给的帖子不在候选池里，索引也未必指得对；这时候用原图当参考图，
+            # 比随便抓一张距离最近的候选图更诚实。
+            compact, _ = prepare_upload(upload, limit=1_200_000, as_jpeg=True)
+            outcome.image_b64 = base64.b64encode(compact).decode("ascii")
+            outcome.image_source = "upload"
+        elif best is not None or ordered or upload:
             outcome.image_b64, outcome.image_source = await self._best_image(best, ordered, upload)
         return outcome
 
@@ -1402,6 +1573,34 @@ class ImageSearcherPlugin(MaiBotPlugin):
         section = self.config.plugin
         return max(1, section.deep_more_limit if section.deep_scan else section.more_limit)
 
+    async def _replay_task(self, current: str, user_id: str, wanted: str) -> tuple[bool, str, int]:
+        """按任务编号重发完整结果。
+
+        带编号却找不到时要说清楚：这是缓存过期，不是指令写错了，所以主动回一句。
+        裸「更多」找不到就悄悄返回，交给正常聊天，免得群里每次说「更多」都蹦提示。
+        """
+        if self._tasks is None:
+            return False, "插件尚未初始化", 0
+        keep = formatting.ttl_text(self.config.plugin.task_ttl_minutes)
+        if wanted:
+            task = self._tasks.get(wanted)
+            if task is None:
+                await self.ctx.send.text(
+                    f"任务 {wanted} 的结果已经清掉了（只保留 {keep}）。重新发图搜一次吧。",
+                    current,
+                )
+                return True, "任务缓存已过期", 2
+            if task.status != "done" or task.outcome is None:
+                await self.ctx.send.text(f"任务 {wanted} 还没搜完，稍等一下再发。", current)
+                return True, "任务未完成", 2
+            await self._send_forward(task, self._more_limit(), replay=True)
+            return True, "已重发指定任务", 2
+        task = self._latest_task(current, user_id)
+        if task is None or task.status != "done" or task.outcome is None:
+            return False, "", 0
+        await self._send_forward(task, self._more_limit(), replay=True)
+        return True, "已重发上次结果", 2
+
     def _eta_text(self) -> str:
         """给用户看的耗时提示。深度检索要明显更久，别按乐观值写死。"""
         return "约 2 分钟" if self.config.plugin.deep_scan else "约 60 秒"
@@ -1450,6 +1649,280 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
         return max(matches, key=lambda item: item.similarity or 0)
 
+    # -- 视觉兜底 ---------------------------------------------------------
+
+    _VISION_DOWNLOAD_CONCURRENCY = 4
+
+    async def _vision_review(self, upload: bytes | None, ordered: list[Candidate]) -> dict[str, Any]:
+        """指纹一条都没通过时，拼一张对照图交给视觉模型找「同一个人」。
+
+        dHash 比的是整图灰度结构，拼图、裁剪、加字、换姿势都会把它打乱；视觉
+        模型看的是人本身，能补上这一类。命中项标 ``status="vision"``，备注里写
+        明是视觉复核、没有指纹依据，不能当成「同一张图」发出去。
+        """
+        section = self.config.vision
+        info: dict[str, Any] = {
+            "ok": False,
+            "checked": 0,
+            "picked": [],
+            "downgraded": 0,
+            "reason": "",
+            "model": "",
+            "error": "",
+        }
+        if upload is None:
+            info["error"] = "没有原图，无法复核"
+            return info
+
+        limit = max(4, min(25, int(section.top_n)))
+        # 按指纹距离取全局最接近的几张，不按引擎分组取：同一个引擎的前 N 条
+        # 常是同一批相似图，跨引擎各拿几条更容易凑出真正的候选。
+        ranked = sorted(
+            (item for item in ordered if item.image_url),
+            key=lambda item: (item.distance if item.distance is not None else 999, -(item.similarity or 0)),
+        )
+        pool: list[Candidate] = []
+        seen: set[str] = set()
+        for item in ranked:
+            if item.image_url in seen:
+                continue
+            seen.add(item.image_url)
+            pool.append(item)
+            if len(pool) >= limit:
+                break
+        if not pool:
+            info["error"] = "候选都没有图片地址"
+            return info
+
+        semaphore = asyncio.Semaphore(self._VISION_DOWNLOAD_CONCURRENCY)
+
+        async def fetch(url: str) -> bytes | None:
+            async with semaphore:
+                return await self._download(url)
+
+        raws = await asyncio.gather(*(fetch(item.image_url) for item in pool), return_exceptions=True)
+        used: list[Candidate] = []
+        images: list[bytes] = []
+        for item, raw in zip(pool, raws):
+            if isinstance(raw, BaseException) or not raw:
+                continue
+            used.append(item)
+            images.append(raw)
+        if not images:
+            info["error"] = "候选图一张都没下载下来"
+            return info
+
+        try:
+            grid = await asyncio.to_thread(vision.build_grid, upload, images)
+        except Exception as error:  # noqa: BLE001 - 拼图失败不该影响已经搜到的文字结果
+            info["error"] = f"拼图失败：{str(error)[:60]}"
+            return info
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": vision.build_prompt(len(images))},
+                    {"type": "image_url", "image_url": {"url": grid.data_url}},
+                ],
+            }
+        ]
+        timeout = max(10, int(section.timeout))
+        options: dict[str, Any] = {
+            "prompt": messages,
+            "task_name": section.task or "vlm",
+            "temperature": 0.1,
+            "max_tokens": 600,
+        }
+        if section.model:
+            # 默认留空、按任务组顺序挑；点名是为了绕开组里靠前的推理型模型，
+            # 它们会把 max_tokens 花在思考上、正文变空。
+            options["model_name"] = section.model
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.call_capability("llm.generate", timeout_ms=timeout * 1000, **options),
+                timeout=timeout + 5,
+            )
+        except asyncio.TimeoutError:
+            info["error"] = f"视觉模型 {timeout} 秒内没返回"
+            return info
+        except Exception as error:  # noqa: BLE001
+            info["error"] = f"视觉模型调用失败：{str(error)[:80]}"
+            return info
+
+        # call_capability 可能已经把结果解包成字符串，两种形态都要接住。
+        payload = result if isinstance(result, dict) else {"success": True, "response": str(result or "")}
+        if not payload.get("success", True):
+            info["error"] = f"视觉模型返回失败：{str(payload.get('error'))[:80]}"
+            return info
+        info["ok"] = True
+        info["checked"] = len(images)
+        info["model"] = str(payload.get("model_name") or payload.get("model") or "")
+        # 推理型模型可能把结论写在 reasoning 里、content 反而是空的，两处都找。
+        text = str(payload.get("response") or payload.get("reasoning") or "")
+        if not text:
+            info["error"] = "视觉模型返回空内容"
+            return info
+
+        info["reason"] = vision.reason_of(text)
+        for number in vision.parse_picks(text, len(images)):
+            candidate = used[number - 1]
+            distance = candidate.distance
+            gap = (
+                f"指纹距离 {distance}，超过阈值 {self.config.plugin.hash_threshold}"
+                if distance is not None
+                else "未做指纹比对"
+            )
+            # 视觉说「同一个人」还不够，得能落到人身上：电商商品图只是同款衣服，
+            # 没有账号的结果也没法核对，两种都降级成疑似，留在参考区。
+            if vision.is_commerce(candidate.platform, candidate.url, candidate.name):
+                candidate.status = "suspect"
+                candidate.note = f"视觉复核：疑似同一个人，但来自电商商品页（{gap}），仅供参考"
+                info["downgraded"] += 1
+                continue
+            if not vision.is_traceable(candidate.handle, candidate.platform, candidate.url):
+                candidate.status = "suspect"
+                candidate.note = f"视觉复核：疑似同一个人，但找不到可核对的账号（{gap}），仅供参考"
+                info["downgraded"] += 1
+                continue
+            candidate.status = "vision"
+            candidate.note = f"视觉复核：同一个人（{gap}）"
+            info["picked"].append(candidate.image_url or candidate.url)
+
+        self.ctx.logger.info(
+            "视觉兜底：候选=%s 传入=%s 命中=%s 降级=%s 模型=%s 理由=%s%s",
+            len(pool),
+            len(images),
+            len(info["picked"]),
+            info["downgraded"],
+            info["model"] or "未返回",
+            info["reason"] or "无",
+            f" 错误={info['error']}" if info["error"] else "",
+        )
+        return info
+
+    async def _grok_lookup(self, upload: bytes | None, candidates: list[Candidate] | None = None) -> dict[str, Any]:
+        """把原图和已有候选一起交给 Grok，让它在 X 上核实到底是谁发的。
+
+        实测过：单纯让它读水印会把 ``@ste11ar021`` 读成 ``@butter021``；让它凭空
+        看图猜关键词去搜，也基本搜不到（实测那轮用的是 ``x_keyword_search``，全
+        军覆没）。所以改成把图片反搜已经拿到的候选账号、标题一起递过去，让它做
+        「核实这个人是不是发过这张图」，只在候选都对不上时才自己另找。
+        """
+        section = self.config.grok
+        info: dict[str, Any] = {
+            "ok": False,
+            "tier": "none",
+            "handle": "",
+            "post_url": "",
+            "reason": "",
+            "model": "",
+            "error": "",
+            "tools": [],
+            "hints": 0,
+        }
+        if upload is None:
+            info["error"] = "没有原图，无法搜人"
+            return info
+        key = (section.api_key or "").strip()
+        if not key:
+            info["error"] = "没有配置 API Key"
+            return info
+        base = (section.base_url or "").strip().rstrip("/")
+        if not base:
+            info["error"] = "没有配置 Base URL"
+            return info
+        model = (section.model or "").strip() or "grok-4.7"
+        try:
+            compact, _ = prepare_upload(upload, limit=900_000, as_jpeg=True)
+        except Exception as error:  # noqa: BLE001 - 图片处理失败不该影响其他兜底
+            info["error"] = f"原图处理失败：{str(error)[:60]}"
+            return info
+        data_url = "data:image/jpeg;base64," + base64.b64encode(compact).decode("ascii")
+        hints = grok.build_hints(candidates or [])
+        info["hints"] = len(hints)
+        body = grok.build_payload(model, data_url, hints=hints)
+        timeout = max(15, int(section.timeout))
+        proxy = self.config.plugin.proxy
+
+        def call() -> dict:
+            session = make_session(proxy, headers={"Authorization": f"Bearer {key}"})
+            try:
+                response = session.post(f"{base}/responses", json=body, timeout=timeout)
+                if response.status_code != 200:
+                    raise HttpError(f"HTTP {response.status_code}：{response.text[:160]}")
+                return response.json()
+            finally:
+                session.close()
+
+        started = time.time()
+        try:
+            payload = await asyncio.wait_for(asyncio.to_thread(call), timeout=timeout + 5)
+        except asyncio.TimeoutError:
+            info["error"] = f"Grok {timeout} 秒内没返回"
+        except Exception as error:  # noqa: BLE001
+            info["error"] = f"Grok 调用失败：{str(error)[:100]}"
+        else:
+            result = grok.parse_output(payload, model=model)
+            info.update(
+                {
+                    "ok": result.ok,
+                    "tier": result.tier,
+                    "handle": result.handle,
+                    "post_url": result.post_url,
+                    "reason": result.reason,
+                    "model": result.model or model,
+                    "tools": result.tools,
+                    "error": result.error,
+                }
+            )
+            if result.tier == "account" and result.handle:
+                # 只给主页时先确认这个号真的存在；查不到就整条丢掉，宁可报没找到，
+                # 也不要把模型编出来的名字当成线索发出去。
+                exists = await self._account_exists(result.handle)
+                if exists is False:
+                    info["tier"] = "none"
+                    info["handle"] = ""
+                    info["error"] = f"@{result.handle} 在 X 上查不到，已丢弃"
+                    info["reason"] = info["error"]
+
+        self.ctx.logger.info(
+            "Grok 兜底：档位=%s 账号=%s 帖子=%s 候选=%s 工具=%s 耗时=%.1fs 理由=%s%s",
+            info["tier"],
+            info["handle"] or "无",
+            info["post_url"] or "无",
+            info["hints"],
+            ",".join(info["tools"]) or "无",
+            time.time() - started,
+            info["reason"] or "无",
+            f" 错误={info['error']}" if info["error"] else "",
+        )
+        return info
+
+    async def _account_exists(self, handle: str) -> bool | None:
+        """查账号在 X 上是否存在。返回 None 表示没查成，不能当成「不存在」。"""
+        if not handle:
+            return None
+        url = f"https://cdn.syndication.twimg.com/widgets/followbutton/info.json?screen_names={handle}"
+
+        def fetch() -> bool | None:
+            session = make_session(self.config.plugin.proxy)
+            try:
+                response = session.get(url, timeout=15)
+                if response.status_code != 200:
+                    return None
+                data = response.json()
+                if not isinstance(data, list):
+                    return None
+                return bool(data)
+            finally:
+                session.close()
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
+        except Exception:  # noqa: BLE001 - 查不了就当没查成，不影响已经拿到的结论
+            return None
+
     def _rank(
         self,
         candidates: list[Candidate],
@@ -1457,7 +1930,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         prefer_pixiv: bool = False,
     ) -> list[Candidate]:
         order = {name: index for index, name in enumerate(names)}
-        status_weight = {"match": 0, "suspect": 1, "unverified": 2, "mismatch": 3, "error": 4}
+        status_weight = {"match": 0, "vision": 1, "suspect": 2, "unverified": 3, "mismatch": 4, "error": 5}
 
         def key(item: Candidate) -> tuple:
             distance = item.distance if item.distance is not None else 999
@@ -1667,16 +2140,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
     def _pending_key(self, kwargs: dict, stream_id: str) -> tuple[str, str]:
         return (self._stream_id(kwargs) or stream_id, self._user_id(kwargs))
 
-    async def _wait_for_image(self, current: str, user_id: str) -> None:
+    async def _wait_for_image(self, current: str, user_id: str, quoted: bool = False) -> None:
         """指令没带图：提示一次，并在超时时间内接住用户补发的单图。"""
         key = (current, user_id)
         seconds = max(10, self.config.plugin.image_wait_seconds)
         self._pending[key] = time.time() + seconds
-        self._vlog("进入等待图片窗口：key=%s 秒数=%s", key, seconds)
-        sent = await self.ctx.send.text(
-            f"没看到图片。把图发出来，或者引用一条带图的消息再发「{COMMAND}」，我在 {seconds} 秒内等你。",
-            current,
-        )
+        self._vlog("进入等待图片窗口：key=%s 秒数=%s 引用=%s", key, seconds, quoted)
+        if quoted:
+            # 引用消息里可能确实有图，但机器人这边没收到过那条消息，取不到只能请用户直接发。
+            text = (
+                f"引用的那条消息我这边没有存底（大概是机器人不在线时发的，或者太早了），取不到图。"
+                f"把图直接发出来再发「{COMMAND}」，我在 {seconds} 秒内等你。"
+            )
+        else:
+            text = f"没看到图片。把图发出来，或者引用一条带图的消息再发「{COMMAND}」，我在 {seconds} 秒内等你。"
+        sent = await self.ctx.send.text(text, current)
         if not _send_ok(sent):
             self.ctx.logger.warning("等待图片提示发送失败：key=%s result=%s", key, sent)
         old = self._pending_timers.pop(key, None)
@@ -1800,7 +2278,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if task is None:
             task = self._latest_task(self._stream_id(kwargs), self._user_id(kwargs))
         if task is None:
-            message = f"没有找到对应的搜索任务，可能已过期（结果保留 {self.config.plugin.task_ttl_minutes} 分钟）。"
+            message = (
+                f"没有找到对应的搜索任务，可能已经清掉了"
+                f"（结果保留 {formatting.ttl_text(self.config.plugin.task_ttl_minutes)}）。"
+            )
             return {"success": False, "content": message, "message": message}
 
         if task.status == "running":
@@ -1843,11 +2324,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return False, "插件尚未初始化", 0
         current = self._stream_id(kwargs) or stream_id
         user_id = self._user_id(kwargs)
-        task = self._latest_task(current, user_id)
-        if task is None or task.status != "done":
-            return False, "", 0  # 没有可重发的任务，交给正常聊天流程
-        await self._send_forward(task, self._more_limit(), replay=True)
-        return True, "已重发上次结果", 2
+        matched = kwargs.get("matched_groups") or {}
+        wanted = str(matched.get("task") or "").strip()
+        return await self._replay_task(current, user_id, wanted)
 
     @Command(
         "image_search_capture",
@@ -1888,18 +2367,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
         matched = kwargs.get("matched_groups") or {}
         arg = str(matched.get("arg") or "").strip()
 
-        if arg in {"更多", "more", "全部"}:
-            if self._tasks is None:
-                return False, "插件尚未初始化", 1
-            task = self._latest_task(current, user_id)
-            if task is None or task.status != "done":
-                await self.ctx.send.text(
-                    f"没有可展开的结果，可能已超过 {self.config.plugin.task_ttl_minutes} 分钟。请重新发图并发送 {COMMAND}",
-                    current,
-                )
-                return True, "没有可用的历史结果", 2
-            await self._send_forward(task, self._more_limit(), replay=True)
-            return True, "已重发完整结果", 2
+        head = (arg.split() or [""])[0]
+        if head in {"更多", "more", "全部"}:
+            # 支持「更多 s-20261103-0832-d7d9」：群里同时有好几次搜索时靠编号定位。
+            parts = arg.split(maxsplit=1)
+            wanted = parts[1].strip() if len(parts) > 1 else ""
+            return await self._replay_task(current, user_id, wanted)
 
         if arg in {"状态", "status"}:
             if self._tasks is not None:
@@ -1920,7 +2393,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         raw, image_url, source, _stale = await self._resolve_image(kwargs)
         self._vlog("指令取图：来源=%s 体积=%sKB 链接=%s", source or "无", len(raw) // 1024 if raw else 0, (image_url or "无")[:80])
         if not raw:
-            await self._wait_for_image(current, user_id)
+            message = kwargs.get("message")
+            quoted = bool(_reply_target(_segments_of(message), message if isinstance(message, dict) else {}))
+            await self._wait_for_image(current, user_id, quoted=quoted)
             return True, "等待图片", 2
 
         try:

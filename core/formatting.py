@@ -44,8 +44,49 @@ def _identity_lines(candidate: Candidate) -> list[str]:
     return lines
 
 
+def _grok_lines(grok: dict) -> list[str]:
+    """Grok 兜底的两档文案：post 是找到，account 只是线索。"""
+    tier = grok.get("tier")
+    reason = str(grok.get("reason") or "").strip()
+    if tier == "post":
+        lines = ["✅ 找到 X 上的原帖"]
+        if grok.get("post_url"):
+            lines.append(f"🔗 {grok['post_url']}")
+        if reason:
+            lines.append(f"🔍 依据：{reason}")
+        return lines
+    if tier == "account":
+        lines = ["🔎 X 搜索指向这个账号，但没核到原帖"]
+        if grok.get("handle"):
+            lines.append(f"🔗 https://x.com/{grok['handle']}")
+        if reason:
+            lines.append(f"🔍 依据：{reason}")
+        return lines
+    return []
+
+
 def _best_block(outcome: SearchOutcome) -> str:
     best = outcome.best
+    grok = outcome.grok or {}
+    grok_lines = _grok_lines(grok)
+    # 帖子档高于视觉档：帖子能点开对照，视觉只是模型判断，所以先给帖子。
+    if grok.get("tier") == "post":
+        if best is not None and best.status == "vision":
+            grok_lines.append("视觉复核也认为是同一个人（模型判断，仅供参考），那张候选见参考区。")
+        return "\n".join(grok_lines)
+    if best is None and grok_lines:
+        # 只拿到账号：比「完全没找到」有用，但没有帖子可对照，仍然算线索。
+        vision = outcome.vision or {}
+        if vision.get("ok") and vision.get("checked"):
+            if vision.get("downgraded"):
+                grok_lines.append(
+                    f"视觉复核挑出 {vision['downgraded']} 条，但都是电商商品页或没有可核对的账号，只当参考。"
+                )
+            else:
+                grok_lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
+        elif vision.get("error"):
+            grok_lines.append(f"视觉复核没做完：{vision['error']}")
+        return "\n".join(grok_lines)
     if best is None:
         compared = sum(1 for item in outcome.candidates if item.distance is not None)
         highest = max((item.distance or 0 for item in outcome.candidates), default=0)
@@ -55,12 +96,37 @@ def _best_block(outcome: SearchOutcome) -> str:
             lines.append(f"已比对 {compared} 条候选，最高指纹距离 {highest}，均未通过阈值。")
         else:
             lines.append("候选图都没能取到或解码，无法验证。")
+        vision = outcome.vision or {}
+        if vision.get("ok") and vision.get("checked"):
+            if vision.get("downgraded"):
+                lines.append(
+                    f"视觉复核挑出 {vision['downgraded']} 条，但都是电商商品页或没有可核对的账号，只当参考。"
+                )
+            else:
+                lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
+        elif vision.get("error"):
+            lines.append(f"视觉复核没做完：{vision['error']}")
+        if grok:
+            if grok.get("error") and grok.get("tier") != "none":
+                lines.append(f"Grok 找人没做完：{grok['error']}")
+            elif grok.get("error"):
+                lines.append(f"Grok 找人没做成：{grok['error']}")
+            else:
+                lines.append("Grok 在 X 上搜过，没有找到对应的账号或帖子。")
         if suspects:
             lines.append(f"另有 {len(suspects)} 条疑似同图，仅供参考，见参考区。")
         if outcome.total_candidates:
             lines.append(f"共收到 {outcome.total_candidates} 条结果，见参考区。")
         return "\n".join(lines)
-    return "\n".join(_identity_lines(best))
+    lines = _identity_lines(best)
+    if best.status == "vision":
+        # 视觉判的是「同一个人」，不是同一张图，别让用户以为这就是那张原图。
+        lines.insert(0, "🧠 没找到同一张图，但视觉复核认为是同一个人")
+        lines.append("⚠️ 这条是视觉模型挑的，不是指纹比对，可能认错，请自行核对。")
+    if grok_lines:
+        lines.append("—")
+        lines.extend(grok_lines)
+    return "\n".join(lines)
 
 
 ENGINE_LABELS = {
@@ -144,7 +210,17 @@ def _header_text(outcome: SearchOutcome, command: str, replay: bool) -> str:
     return header
 
 
-def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool) -> list[str]:
+def ttl_text(minutes: int) -> str:
+    """把保留时长写成人话：1440 分钟读起来太费劲。"""
+    if minutes >= 1440 and minutes % 1440 == 0:
+        return f"{minutes // 1440} 天"
+    if minutes >= 60:
+        hours = minutes / 60
+        return f"{hours:.0f} 小时" if hours == int(hours) else f"{hours:.1f} 小时"
+    return f"{minutes} 分钟"
+
+
+def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool, task_id: str = "") -> list[str]:
     lines = [_route_line(outcome), _ai_line(outcome.ai)]
     if outcome.image_b64 and outcome.image_source == "upload":
         lines.append("（候选图都没取到，转发里的图是你发的原图）")
@@ -157,7 +233,12 @@ def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay
     if replay:
         lines.append("以上为全部参考结果")
     else:
-        lines.append(f"{ttl_minutes} 分钟内回复「{command} 更多」可查看全部结果")
+        if task_id:
+            # 编号是「更多」的凭据：群里同时有好几次搜索时，光说「更多」会取错。
+            lines.append(f"任务编号：{task_id}（保留 {ttl_text(ttl_minutes)}）")
+            lines.append(f"回复「{command} 更多 {task_id}」查看全部结果")
+        else:
+            lines.append(f"{ttl_text(ttl_minutes)}内回复「{command} 更多」可查看全部结果")
     return lines
 
 
@@ -207,7 +288,9 @@ def build_forward_nodes(
         )
 
     # 参考区按引擎分组，每个引擎一个节点，组内候选顺序沿用排序结果。
-    if show_reference:
+    # 命中时（指纹、视觉、Grok 任一）首次回复只给结论，参考区留给「更多」：
+    # 一次搜到结果还要刷四五条转发，群里看着比没找到更烦。
+    if show_reference and outcome.status != "ok":
         for engine, items in engine_groups(outcome, outcome.best, limit):
             content: list[dict] = [
                 {"type": "text", "content": f"▍{_engine_name(engine)}（{len(items)} 条）"}
@@ -219,7 +302,16 @@ def build_forward_nodes(
                     content.append({"type": "image", "content": image})
             nodes.append(node(content))
 
-    nodes.append(node([{"type": "text", "content": "\n".join(_footer_lines(outcome, command, ttl_minutes, replay))}]))
+    nodes.append(
+        node(
+            [
+                {
+                    "type": "text",
+                    "content": "\n".join(_footer_lines(outcome, command, ttl_minutes, replay, task.task_id)),
+                }
+            ]
+        )
+    )
 
     return nodes
 
@@ -305,7 +397,8 @@ def build_text_summary(
     lines = [f"任务 {task.task_id}：{_best_block(outcome)}"]
     if outcome.status != "ok":
         lines.append(f"结论：{outcome.status}")
-    if show_reference and outcome.candidates:
+    if show_reference and outcome.candidates and outcome.status != "ok":
+        # 命中时不列参考候选：模型只需要知道结论，列多了它会忍不住在群里复述一遍。
         groups = engine_groups(outcome, outcome.best, limit)
         if groups:
             lines.append("其他候选（按引擎分组）：")

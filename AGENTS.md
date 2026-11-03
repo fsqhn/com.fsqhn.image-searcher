@@ -17,6 +17,8 @@ plugin.py           配置模型 + 生命周期 + 取图 + 编排 + Tool/Command
 core/engines.py     Lens / Yandex / 百度 / SauceNAO 适配 + detect_ai + verify_candidate
 core/hashing.py     dHash 指纹 + prepare_upload（压到 480KB）
 core/formatting.py  合并转发四节点、路线行、重放文案
+core/vision.py      视觉兜底：拼对照图、写 prompt、解析回复（纯函数，不碰网络）
+core/grok.py        Grok 兜底：写 prompt、拼请求体、解析帖子/账号链接（纯函数，不碰网络）
 core/tasks.py       SearchOutcome（含 route）、TaskStore（TTL / 上限 / 落盘恢复）
 core/commands.py    指令正则构建
 core/maibot_compat.py  能力返回值解包
@@ -26,7 +28,15 @@ core/maibot_compat.py  能力返回值解包
 
 **异步任务化**：搜索 30~60 秒，Tool 立即返回 `task_id`，不能 await 到结果。
 
-**指纹而不是视觉模型**：判断「是不是同一张图」用 dHash。别引入视觉模型依赖，MaiBot 默认 `visual=false`，而且模型给的相似度不可靠。
+**指纹是主路，视觉只兜底**：判断「是不是同一张图」仍然只看 dHash，别改。只有整轮一个 `match` 都没有、`[vision] enabled` 开着、且不是插画路线时，才把目标图和最接近的候选拼成一张编号网格交给 `vlm` 任务，问的是「有没有同一个人」——不要求同一张图。命中项标 `status="vision"`，文案必须写「视觉复核」，不能冒充同一张图。拼图、prompt、回复解析都在 `core/vision.py`（纯函数，有单测），16 格一次约 2~15 秒。
+
+**Grok 兜底与视觉并行，分两档**：同一个触发条件、`[grok] enabled` 开着且有 `api_key` 时，两边一起发出去（`asyncio.gather`），各自超时。发给它的不只是原图，还有前 8 条候选（`账号｜平台｜标题`），让它先核对候选里谁是发布者，都对不上才自己另搜（`core/grok.py` 的 `build_hints()`，日志里有 `候选=` 可核对）。判据只看它返回的链接：带 `status/<id>` 算「找到」，只有账号主页算「线索」，两者都不能说成同一张图。只给账号时还会用 `cdn.syndication.twimg.com` 确认账号真实存在，确认不了就整条丢掉——宁可报没找到，也不要把模型编的名字发出去。解析在 `core/grok.py`（纯函数，有单测）。
+
+**视觉命中还要过两道闸门**：模型说「同一个人」不算完。候选落在速卖通 / 阿里 / 淘宝 / 1688 / Amazon / eBay 这类电商站（那是同款商品，不是同一个人），或者没有可核对的账号（既没 handle，也不在 X / pixiv / 微博这种社交站），一律降级成 `suspect` 只进参考区，日志里记 `降级=N`。判据在 `core/vision.py` 的 `is_commerce()` / `is_traceable()`，改关键词先改 `tests/test_vision.py`。视觉命中发出去时，结论必须带一句免责声明（模型挑的、可能认错、请自行核对），文案在 `core/formatting.py` 的 `_best_block()`。
+
+**命中时首次回复只给结论**：只要 `status == "ok"`（指纹、视觉、Grok 任一命中），`build_forward_nodes` 与 `build_text_summary` 都不列参考区，用户要细节得回「更多」。没找到时才把参考区发出来。改配图或转发结构时注意这条，别让命中场景又刷回四五条。
+
+**「更多」靠任务编号定位**：首次回复的页脚必须带 `task_id`，用户回「更多 <task_id>」重发那一次的结果；不带编号时退回当前会话最近一次。结果默认保留 1 天（`task_ttl_minutes`），过期后任务被清掉，带编号再问要明确回「缓存已清，重新搜」，不能装作没看见。`TaskStore._evict` 的 80 条上限也是为这个 TTL 服务的，别随手调小。
 
 **图片字节自给自足**：引擎都上传图片字节，不依赖 QQ 图链时效；只有 Lens 上传失败才回退图链。
 
@@ -84,6 +94,11 @@ core/maibot_compat.py  能力返回值解包
 10. **单条合并转发最多放 6 张图**：实测 6 张能过、13 张被 NapCat 以 `send_group_forward_msg` 失败拒掉（错误信息为空，`_send_ok` 判 False）。所以「更多」在图片超过 6 张时按引擎拆成多条，每条带 `1/N` 页码，最佳匹配只在第一批、页脚只在最后一批。别再把十几张图塞进一条转发。
 11. **候选图下载要分线路**：Yandex 图床 `avatars.mds.yandex.net` 在服务器上直连约 1 秒，走 127.0.0.1:6789 代理常 15 秒以上甚至 SSL 报错，导致验证阶段整批被标「未验证」。`httpclient.download_routes()` 按主机决定顺序（Yandex 系直连优先，其余代理优先），`download_image_multi()` 负责回退。新增引擎时别忘了让它走 multi 版本。
 12. **展示按引擎分组，配图分两档**：`build_forward_nodes` 里一个引擎一个节点，首次回复每个引擎只贴最接近那张（`outcome.images` 里有哪张就贴哪张，键是候选图地址），回「更多」时每个候选都贴图。图由 `_ensure_engine_images` 下载并压到 60KB 左右，别把 1MB 的原图塞进转发，否则转发容易因体积被拒。`outcome.images` 只在内存、不落盘，重放磁盘恢复的任务时靠重新下载补齐。
+13. **vlm 组里的模型都能读图，但推理型的会截断正文**：早前用 96×96 合成小图测出 `prompt_tokens` 只有 38~43，就误判为「模型把图丢了」；换成 1280×1280 真图重测，`火山glm5.3flash` 是 2140 tokens 并正确答出颜色，`dots3-note-prev` 是 1321 tokens 但把 600 输出额度全花在 reasoning 上、`content` 为空。所以 `[vision] model` 默认留空、按任务组顺序挑（别人未必装了 Qwen）；真想点名就填 `Qwen/Qwen3-VL-32B-Instruct`（2.6 秒、正文直接给结论）。测多模态一定要用真实尺寸的图，别用纯色小方块。
+14. **视觉调用要传 `model_name` 不能只传 `model`**：只传 `model` 时 Host 会先按任务名解析，`vlm` 是任务名不是模型名。用 `ctx.call_capability("llm.generate", prompt=..., task_name="vlm", model_name="...")`，图片走标准 `{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}`，Host 只认 Data URL，传 http 图链会直接报错。
+15. **Grok 读水印会读错，别拿它当 OCR**：同一张图上写的是 `@ste11ar021`，Grok 整图读成 `@butter021`；把水印区域裁下来放大，它直接说看不见。所以 `core/grok.py` 的 prompt 明确禁止按水印猜，判定只认返回里的链接。`@butter021` 这类必须靠 `_account_exists()` 才会被挡掉。
+16. **Grok 只能走 `/v1/responses` + `tools:[{"type":"x_search"}]`**：`chat/completions` 带 `search_parameters` 会被上游打回 410。图片用 `{"type":"input_image","image_url":"data:..."}`，`火山` 和 `dots3` 的 provider 用公网图链都会 400，只认 data URL。一次完整检索约 48 秒、9 次 `x_search`、约两毛美元；历史上出现过 121 秒后 502，所以超时不能省。
+17. **拼图要逐张解码**：候选图可能是几千像素的原图，26 张同时解码能把 0.7G 空闲内存顶爆。`vision.build_grid` 是解码→缩放→贴画布→丢引用，一次只有一张原图在内存里；`MAX_SOURCE_PIXELS` 是给这件事兜底的，别去掉。
 
 ## 排障顺序
 
@@ -98,7 +113,9 @@ core/maibot_compat.py  能力返回值解包
 
 只有一个代理设置：`[plugin] proxy`，引擎、候选图下载、AI 检测全走它。写 `direct` / `none` / `off` 表示强制直连，留空等同直连。已去掉引擎段里的 proxy 与 `image_proxy`，不要再加回来。
 
-四个引擎是顶层配置段 `[lens]` / `[yandex]` / `[baidu]` / `[saucenao]`，与 `[ai_detect]` 平级。**不要**改回 `[engines.lens]` 这种二阶嵌套：SDK 只把顶层配置拆成独立区块，二阶嵌套在 WebUI 里会渲染成 `[object Object]`，用户根本没法编辑。
+四个引擎是顶层配置段 `[lens]` / `[yandex]` / `[baidu]` / `[saucenao]`，与 `[vision]` / `[grok]` / `[ai_detect]` 平级。**不要**改回 `[engines.lens]` 这种二阶嵌套：SDK 只把顶层配置拆成独立区块，二阶嵌套在 WebUI 里会渲染成 `[object Object]`，用户根本没法编辑。
+
+`0.5.5` 把 `vision_*` / `grok_*` 从 `[plugin]` 拆成了 `[vision]` / `[grok]`（字段名去掉前缀，`fallback` 改名 `enabled`）。老配置靠 `core/config.py` 的 `migrate_legacy_sections()` 走 `normalize_plugin_config` 一次性搬过去，只在目标键还不存在时写入，别删掉这段，否则已有用户的 Grok key 会丢。
 
 ## 测试
 
