@@ -207,6 +207,8 @@ def _header_text(outcome: SearchOutcome, command: str, replay: bool) -> str:
                 header = f"🔍 {command} · 疑似 AI 生成"
         except (TypeError, ValueError):
             pass
+    if outcome.cached:
+        header += " · 缓存"
     return header
 
 
@@ -222,6 +224,9 @@ def ttl_text(minutes: int) -> str:
 
 def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool, task_id: str = "") -> list[str]:
     lines = [_route_line(outcome), _ai_line(outcome.ai)]
+    if outcome.cached:
+        # 说清这是复用，不是刚跑出来的：同一张图结果一样，但引擎这次一条都没调。
+        lines.append("💾 这张图之前搜过，直接复用了当时的结果（引擎没有重新跑）")
     if outcome.image_b64 and outcome.image_source == "upload":
         lines.append("（候选图都没取到，转发里的图是你发的原图）")
     elif outcome.image_b64 and outcome.best is None:
@@ -239,6 +244,8 @@ def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay
             lines.append(f"回复「{command} 更多 {task_id}」查看全部结果")
         else:
             lines.append(f"{ttl_text(ttl_minutes)}内回复「{command} 更多」可查看全部结果")
+        # 缓存命中时结果会秒回，给个明确的重新搜入口，免得以为只能等缓存过期。
+        lines.append(f"重新搜一遍（忽略缓存）：发图时带上「{command} 重搜」")
     return lines
 
 

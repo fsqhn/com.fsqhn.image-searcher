@@ -9,14 +9,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.extract import (  # noqa: E402
+    account_key,
+    canonical_account_url,
+    dedupe_accounts,
     extract_identity,
     is_pixiv_platform,
     is_social_platform,
     is_x_platform,
+    match_account,
     platform_of,
     promote_mirror,
     relevance_rank,
 )
+from core.engines import Candidate  # noqa: E402
 from core.keypool import KeyPool  # noqa: E402
 
 
@@ -55,6 +60,72 @@ class ExtractIdentityTest(unittest.TestCase):
         name, handle = extract_identity("https://example.com/gallery/9", "一张相册图")
         self.assertEqual(handle, "")
         self.assertEqual(name, "一张相册图")
+
+
+class AccountPageTest(unittest.TestCase):
+    """账号页识别：只认账号页，帖子页/搜索页不硬猜。"""
+
+    def test_instagram_profile(self) -> None:
+        _name, handle = extract_identity("https://www.instagram.com/usagi_rr/", "ins")
+        self.assertEqual(handle, "@usagi_rr")
+
+    def test_instagram_post_is_not_account(self) -> None:
+        _name, handle = extract_identity("https://www.instagram.com/p/Cabc123/", "一条帖子")
+        self.assertEqual(handle, "")
+
+    def test_pixiv_member_normalized(self) -> None:
+        _name, handle = extract_identity("https://www.pixiv.net/member.php?id=123456", "画师")
+        self.assertEqual(handle, "UID 123456")
+        self.assertEqual(
+            canonical_account_url("https://www.pixiv.net/member.php?id=123456"),
+            "https://www.pixiv.net/users/123456",
+        )
+
+    def test_weibo_uid(self) -> None:
+        _name, handle = extract_identity("https://weibo.com/u/1234567890", "")
+        self.assertEqual(handle, "UID 1234567890")
+
+    def test_weibo_nickname(self) -> None:
+        _name, handle = extract_identity("https://weibo.com/n/%E5%B0%8F%E7%99%BD", "")
+        self.assertEqual(handle, "@小白")
+
+    def test_weibo_status_is_not_account(self) -> None:
+        self.assertIsNone(match_account("https://weibo.com/status/1234567890"))
+        self.assertIsNone(match_account("https://m.weibo.cn/status/1234567890"))
+
+    def test_x_intent_is_not_account(self) -> None:
+        self.assertIsNone(match_account("https://x.com/intent/follow?screen_name=abc"))
+
+    def test_x_status_gives_profile(self) -> None:
+        account = match_account("https://x.com/usagi_rr/status/123")
+        self.assertIsNotNone(account)
+        assert account is not None
+        self.assertEqual(account[1], "usagi_rr")
+        self.assertEqual(account[2], "https://x.com/usagi_rr")
+
+
+class AccountKeyTest(unittest.TestCase):
+    def test_uid_and_at_normalized(self) -> None:
+        self.assertEqual(account_key("微博", "UID 123"), account_key("微博", "123"))
+        self.assertEqual(account_key("X (Twitter)", "@Usagi_RR"), account_key("X (Twitter)", "usagi_rr"))
+
+    def test_empty(self) -> None:
+        self.assertEqual(account_key("微博", ""), "")
+
+    def test_dedupe_keeps_better_one(self) -> None:
+        weak = Candidate(engine="lens", handle="@usagi_rr", platform="X (Twitter)", status="unverified")
+        strong = Candidate(engine="yandex", handle="@Usagi_RR", platform="X (Twitter)", status="match", distance=0)
+        kept = dedupe_accounts([weak, strong])
+        self.assertEqual(kept, [strong])
+
+    def test_dedupe_keeps_first(self) -> None:
+        first = Candidate(engine="lens", handle="@usagi_rr", platform="X (Twitter)", distance=0)
+        dup = Candidate(engine="yandex", handle="@usagi_rr", platform="X (Twitter)", distance=12)
+        other = Candidate(engine="baidu", handle="@someone", platform="X (Twitter)")
+        blank = Candidate(engine="lens", platform="aliexpress.ru")
+        blank2 = Candidate(engine="baidu", platform="aliexpress.ru")
+        kept = dedupe_accounts([first, dup, other, blank, blank2])
+        self.assertEqual(kept, [first, other, blank, blank2])
 
 
 class PromoteSotweTest(unittest.TestCase):

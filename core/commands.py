@@ -7,6 +7,9 @@ MaiBot 传给指令匹配的是消息纯文本，带图的消息会带前置占�
 引用消息时占位符里还套着方括号：「[回复了某人的消息: [image]] 麦麦寻人」。
 只按「不含 ]」截断的写法会在内层 [image] 的右括号处提前收尾，
 后面的指令就被当成多余内容，整条消息匹配失败，所以占位符要允许嵌套。
+
+另外，图片段在纯文本里可能是空的，只剩一个前导空格（例如「图 + 麦麦寻人」这条
+消息的纯文本是「 麦麦寻人」，连 [image] 都没有）。因此开头还要允许任意空白。
 """
 
 from __future__ import annotations
@@ -25,14 +28,30 @@ def _bracket_placeholder(depth: int = 2) -> str:
 
 PLACEHOLDER_PREFIX = r"(?:" + _bracket_placeholder() + r"\s*)*"
 
+# 指令参数里写在最前面的「重搜」：无视按图缓存，强制重新跑一遍引擎。
+FORCE_KEYWORDS = frozenset({"重搜", "重新搜", "刷新", "强制", "force", "fresh"})
+
+
+def split_force(arg: str) -> tuple[bool, str]:
+    """把参数开头的「重搜」剥出来，返回 (是否强制重搜, 剩余参数)。
+
+    支持「重搜」「重搜 更多」这种写法；没写就是 (False, 原样)。
+    """
+    text = (arg or "").strip()
+    parts = text.split(None, 1)
+    if parts and parts[0] in FORCE_KEYWORDS:
+        return True, parts[1].strip() if len(parts) > 1 else ""
+    return False, text
+
+
 
 def build_command_pattern(names: list[str]) -> str:
     body = "|".join(re.escape(item) for item in names if item)
-    return r"^" + PLACEHOLDER_PREFIX + r"(?:" + body + r")(?:\s+(?P<arg>[\s\S]*))?$"
+    return r"^\s*" + PLACEHOLDER_PREFIX + r"(?:" + body + r")(?:\s+(?P<arg>[\s\S]*))?$"
 
 
 def build_more_pattern(keywords: list[str]) -> str:
     body = "|".join(re.escape(item) for item in keywords if item)
     # 允许在「更多」后面跟任务编号：「更多 s-20261103-0832-d7d9」。
     # 不编号时取当前会话最近一次，保持原有用法不变。
-    return r"^" + PLACEHOLDER_PREFIX + r"(?:" + body + r")(?:\s+(?P<task>[A-Za-z0-9][A-Za-z0-9\-_]{3,}))?\s*$"
+    return r"^\s*" + PLACEHOLDER_PREFIX + r"(?:" + body + r")(?:\s+(?P<task>[A-Za-z0-9][A-Za-z0-9\-_]{3,}))?\s*$"

@@ -157,6 +157,19 @@ class ForwardNodesTest(unittest.TestCase):
         self.assertIn("1 天", text)
         self.assertIn("更多", text)
 
+    def test_footer_offers_force_research_after_more(self) -> None:
+        """页脚在「更多」后面给出重搜入口：缓存秒回时也知道怎么强制重跑。"""
+        task = _task(self._grouped_outcome())
+        nodes = build_forward_nodes(task, command="麦麦寻人", ttl_minutes=1440)
+        text = "\n".join(
+            part.get("content", "")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn("重搜", text)
+        self.assertGreater(text.index("重搜"), text.index("更多"))
+
     def test_ttl_text_reads_in_human_units(self) -> None:
         self.assertEqual(ttl_text(15), "15 分钟")
         self.assertEqual(ttl_text(60), "1 小时")

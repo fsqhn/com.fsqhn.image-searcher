@@ -46,6 +46,13 @@ class BuildPayloadTest(unittest.TestCase):
         self.assertIn("没找到", text)
         self.assertIn("不要根据水印猜", text)
 
+    def test_prompt_requires_image_search_when_hints_miss(self) -> None:
+        """候选都对不上时必须拿图去 x_search：自拍图只靠关键词必然搜不到。"""
+        body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA", hints=["@someone | X | 标题"])
+        text = body["input"][0]["content"][0]["text"]
+        self.assertIn("这张图本身作为检索输入", text)
+        self.assertIn("算没完成任务", text)
+
     def test_hints_are_passed_into_prompt(self) -> None:
         """已有候选要写进 prompt，让它先核对候选而不是凭空猜关键词。"""
         body = grok.build_payload(

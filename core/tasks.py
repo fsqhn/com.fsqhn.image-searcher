@@ -40,6 +40,9 @@ class SearchOutcome:
     grok: dict | None = None
     # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
     images: dict[str, str] = field(default_factory=dict)
+    # 这次结果来自按图缓存。命中时不重跑引擎，elapsed_ms 是当初那次的耗时。
+    cached: bool = False
+    cached_at: float = 0.0
 
     def to_summary(self) -> dict:
         """可落盘的摘要（不含图片）。"""
@@ -58,6 +61,27 @@ class SearchOutcome:
             "vision": self.vision,
             "grok": self.grok,
         }
+
+    @classmethod
+    def from_summary(cls, summary: dict | None) -> "SearchOutcome":
+        """从落盘摘要复原。任务表和按图缓存共用这一份口径。"""
+        summary = summary or {}
+        best = summary.get("best")
+        return cls(
+            status=str(summary.get("status") or "error"),
+            best=Candidate(**best) if best else None,
+            candidates=[Candidate(**item) for item in summary.get("candidates") or []],
+            ai=summary.get("ai"),
+            route=str(summary.get("route") or "photo"),
+            route_reason=str(summary.get("route_reason") or ""),
+            errors=summary.get("errors") or {},
+            engine_counts=summary.get("engine_counts") or {},
+            elapsed_ms=int(summary.get("elapsed_ms") or 0),
+            total_candidates=int(summary.get("total_candidates") or 0),
+            image_source=str(summary.get("image_source") or ""),
+            vision=summary.get("vision"),
+            grok=summary.get("grok"),
+        )
 
 
 @dataclass
@@ -214,21 +238,7 @@ class TaskStore:
                 if now - finished_at > self._ttl:
                     continue
                 summary = payload.get("summary") or {}
-                outcome = SearchOutcome(
-                    status=str(summary.get("status") or "error"),
-                    best=Candidate(**summary["best"]) if summary.get("best") else None,
-                    candidates=[Candidate(**item) for item in summary.get("candidates") or []],
-                    ai=summary.get("ai"),
-                    route=str(summary.get("route") or "photo"),
-                    route_reason=str(summary.get("route_reason") or ""),
-                    errors=summary.get("errors") or {},
-                    engine_counts=summary.get("engine_counts") or {},
-                    elapsed_ms=int(summary.get("elapsed_ms") or 0),
-                    total_candidates=int(summary.get("total_candidates") or 0),
-                    image_source=str(summary.get("image_source") or ""),
-                    vision=summary.get("vision"),
-                    grok=summary.get("grok"),
-                )
+                outcome = SearchOutcome.from_summary(summary)
                 task = SearchTask(
                     task_id=task_id,
                     stream_id=str(payload.get("stream_id") or ""),

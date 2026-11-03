@@ -20,6 +20,37 @@ BILIBILI_VIDEO_RE = re.compile(r"bilibili\.com/video/(BV[A-Za-z0-9]+)")
 DOUYIN_USER_RE = re.compile(r"douyin\.com/user/([A-Za-z0-9_\-]+)")
 WEIBO_UID_RE = re.compile(r"weibo\.(?:com|cn)/(?:u/)?(\d{5,})")
 
+# ── 账号页识别 ────────────────────────────────────────────────────────────
+#
+# 引擎（尤其 Lens / 百度）给回来的链接大量是帖子页、图集页、搜索页，
+# 甚至有 x.com/i/… 这种占位路径。只按「域名 + 第一段」抓 handle 会把它们当成账号，
+# 用户点开不是 404 就是首页。这里显式列白名单形态 + 每平台的路径黑名单。
+
+INSTAGRAM_ACCOUNT_RE = re.compile(r"^https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]{2,30})/?", re.I)
+PIXIV_USER_RE = re.compile(
+    r"^https?://(?:www\.)?pixiv\.net/(?:en/)?(?:users/(\d+)|member\.php\?id=(\d+))",
+    re.I,
+)
+WEIBO_NICK_RE = re.compile(r"^https?://(?:www\.|m\.)?weibo\.(?:com|cn)/n/([^/?#]+)", re.I)
+TIKTOK_ACCOUNT_RE = re.compile(r"^https?://(?:www\.)?tiktok\.com/@([A-Za-z0-9_.]{2,30})", re.I)
+
+# 这些第一段不是账号，是功能页。命中就直接判定「不是账号页」。
+ACCOUNT_PATH_DENY: dict[str, frozenset[str]] = {
+    "x": frozenset({
+        "i", "intent", "share", "home", "search", "hashtag", "explore", "notifications",
+        "messages", "settings", "login", "signup", "tos", "privacy", "account", "compose",
+    }),
+    "weibo": frozenset({
+        "ttarticle", "p", "show", "status", "detail", "photo", "video", "article", "fav",
+        "like", "comment", "search", "hot", "topic", "tv", "page", "s", "login", "signup", "reg",
+    }),
+    "instagram": frozenset({
+        "p", "reel", "reels", "explore", "accounts", "stories", "tv", "about", "legal",
+        "directory", "developer", "web",
+    }),
+    "pixiv": frozenset({"artworks", "i", "en", "tags", "search", "ranking", "novel", "ajax", "bookmark"}),
+}
+
 HIGH_VALUE_HOSTS = (
     "sotwe.com",
     "twstalker.com",
@@ -151,23 +182,77 @@ def platform_of(url: str = "", source: str = "", title: str = "") -> str:
     return "未知来源"
 
 
+def match_account(url: str = "") -> tuple[str, str, str] | None:
+    """把链接解析成 (平台标识, 账号, 规范化的账号页地址)。
+
+    只认账号页形态：帖子页、图集页、搜索页一律返回 None，交给标题兜底。
+    pixiv 老站 `member.php?id=` 会归一成 `/users/<id>`，微博 `/n/昵称` 会解码。
+    """
+    text = unquote((url or "").strip())
+    if not text:
+        return None
+
+    x = X_STATUS_RE.match(text)
+    if x and not (x.group(1) or "").lower() in ACCOUNT_PATH_DENY["x"]:
+        handle = x.group(1)
+        return "x", handle, f"https://x.com/{handle}"
+
+    weibo = re.match(r"^https?://(?:www\.|m\.)?weibo\.(?:com|cn)/(?:u/)?(\d{5,})", text, re.I)
+    if weibo:
+        uid = weibo.group(1)
+        return "weibo", uid, f"https://weibo.com/u/{uid}"
+
+    nick = WEIBO_NICK_RE.match(text)
+    if nick:
+        name = nick.group(1)
+        return "weibo", name, f"https://weibo.com/n/{name}"
+
+    bili = BILIBILI_SPACE_RE.search(text)
+    if bili:
+        return "bilibili", bili.group(1), f"https://space.bilibili.com/{bili.group(1)}"
+
+    douyin = DOUYIN_USER_RE.search(text)
+    if douyin:
+        return "douyin", douyin.group(1), f"https://www.douyin.com/user/{douyin.group(1)}"
+
+    insta = INSTAGRAM_ACCOUNT_RE.match(text)
+    if insta and (insta.group(1) or "").lower() not in ACCOUNT_PATH_DENY["instagram"]:
+        handle = insta.group(1)
+        return "instagram", handle, f"https://www.instagram.com/{handle}/"
+
+    pixiv = PIXIV_USER_RE.match(text)
+    if pixiv:
+        uid = pixiv.group(1) or pixiv.group(2) or ""
+        if uid:
+            return "pixiv", uid, f"https://www.pixiv.net/users/{uid}"
+
+    tiktok = TIKTOK_ACCOUNT_RE.match(text)
+    if tiktok:
+        handle = tiktok.group(1)
+        return "tiktok", handle, f"https://www.tiktok.com/@{handle}"
+
+    return None
+
+
+def canonical_account_url(url: str = "") -> str:
+    """账号页归一化：认得的平台给规范地址，不认得原样返回。"""
+    account = match_account(url)
+    return account[2] if account else (url or "")
+
+
 def extract_identity(url: str, title: str = "") -> tuple[str, str]:
     """返回 (名字, 账号)。
 
-    账号优先从链接里取；X 的结果链接本身就是账号或推文页，最可靠。
+    账号优先从链接里取：只在链接是账号页形态时才认，帖子页/搜索页不硬猜。
     """
     clean_title = SOTWE_TITLE_SUFFIX_RE.sub("", title or "").strip()
     handle = ""
 
-    x_match = X_STATUS_RE.match(url or "")
-    if x_match:
-        handle = "@" + x_match.group(1)
-    elif BILIBILI_SPACE_RE.search(url or ""):
-        handle = "UID " + BILIBILI_SPACE_RE.search(url or "").group(1)
-    elif DOUYIN_USER_RE.search(url or ""):
-        handle = "@" + DOUYIN_USER_RE.search(url or "").group(1)
-    elif WEIBO_UID_RE.search(url or ""):
-        handle = "UID " + WEIBO_UID_RE.search(url or "").group(1)
+    account = match_account(url)
+    if account:
+        raw = account[1]
+        # 纯数字（微博 uid / B站 mid / pixiv 会员号）看不出是谁，标成 UID。
+        handle = f"UID {raw}" if raw.isdigit() else "@" + raw
     elif BILIBILI_VIDEO_RE.search(url or ""):
         handle = BILIBILI_VIDEO_RE.search(url or "").group(1)
 
@@ -179,6 +264,49 @@ def extract_identity(url: str, title: str = "") -> tuple[str, str]:
 
     name = HANDLE_RE.sub("", clean_title).strip(" -–—|·")
     return name[:60], handle
+
+
+def account_key(platform: str, handle: str) -> str:
+    """账号去重用的键。没有账号的结果返回空串，不参与去重。"""
+    text = (handle or "").strip()
+    if text.startswith("UID "):
+        text = text[4:]
+    text = text.lstrip("@").strip().lower()
+    if not text:
+        return ""
+    return f"{(platform or '').strip()}|{text}"
+
+
+_STATUS_QUALITY = {"match": 0, "vision": 1, "suspect": 2, "unverified": 3, "mismatch": 4, "error": 5}
+
+
+def _quality(item: object) -> tuple[int, int]:
+    """同一条账号被多个引擎撞见时，比较谁更可信：先看验证状态，再看指纹距离。"""
+    status = str(getattr(item, "status", "") or "unverified")
+    distance = getattr(item, "distance", None)
+    return (_STATUS_QUALITY.get(status, 3), distance if isinstance(distance, int) else 999)
+
+
+def dedupe_accounts(items: list) -> list:
+    """同一账号被多个引擎撞见时只留一条，位置按第一次出现，内容取更可信的那条。
+
+    没有账号的候选原样保留——参考区里它们仍然有用。
+    """
+    index_of: dict[str, int] = {}
+    kept: list = []
+    for item in items or []:
+        key = account_key(getattr(item, "platform", ""), getattr(item, "handle", ""))
+        if not key:
+            kept.append(item)
+            continue
+        position = index_of.get(key)
+        if position is None:
+            index_of[key] = len(kept)
+            kept.append(item)
+            continue
+        if _quality(item) < _quality(kept[position]):
+            kept[position] = item
+    return kept
 
 
 def relevance_rank(url: str = "", source: str = "") -> int:

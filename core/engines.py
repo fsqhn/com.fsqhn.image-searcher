@@ -39,6 +39,10 @@ SERP_UPLOAD_LIMIT = 500 * 1024
 SAUCENAO_ENDPOINT = "https://saucenao.com/search.php"
 SIGHTENGINE_ENDPOINT = "https://api.sightengine.com/1.0/check.json"
 
+# 引擎解析逻辑的版本号。改动结果解析、候选字段含义时把它加一，
+# 按图缓存会自动作废，不会把旧格式的结果当成新结果发出去。
+ENGINES_VERSION = "2026-11-03.1"
+
 YANDEX_HOSTS = ("https://yandex.ru", "https://yandex.com.tr", "https://yandex.com")
 BAIDU_UPLOAD = "https://graph.baidu.com/upload"
 

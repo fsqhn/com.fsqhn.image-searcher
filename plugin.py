@@ -18,10 +18,11 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.config import build_plugin_default_config, merge_plugin_config_data
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
-from .core import formatting, grok, vision
-from .core.commands import build_command_pattern, build_more_pattern
+from .core import fxtwitter, formatting, grok, resultcache, vision
+from .core.commands import build_command_pattern, build_more_pattern, split_force
 from .core.config import migrate_legacy_sections
 from .core.engines import (
+    ENGINES_VERSION,
     BaiduEngine,
     Candidate,
     EngineError,
@@ -31,8 +32,8 @@ from .core.engines import (
     detect_ai,
     verify_candidate,
 )
-from .core.extract import is_pixiv_platform, is_social_platform, is_x_platform
-from .core.hashing import dhash, prepare_upload
+from .core.extract import dedupe_accounts, is_pixiv_platform, is_social_platform, is_x_platform
+from .core.hashing import dhash, hamming, prepare_upload
 from .core.httpclient import HttpError, download_image_multi, make_session
 from .core.keypool import KeyPool
 from .core.maibot_compat import unwrap_capability
@@ -439,6 +440,24 @@ class PluginSectionConfig(PluginConfigBase):
         ge=1,
         le=10080,
     )
+    cache_enabled: bool = Field(
+        default=True,
+        description=(
+            "同一张图搜过一次后，直接把上次的结果发出来，不再调用引擎。"
+            "键是图片内容 + 引擎版本，换张图、或者插件升级解析逻辑就自动重搜。"
+        ),
+        json_schema_extra=_ui(
+            "按图缓存（同一张图复用结果）",
+            "默认开启。命中时回复里会标「缓存」，不消耗任何引擎额度。",
+        ),
+    )
+    cache_days: int = Field(
+        default=30,
+        description="搜到结果后缓存保留多久。同一张图在这段时间内再发，直接复用。",
+        json_schema_extra=_ui("缓存保留天数", "默认 30 天。没找到的结果不缓存。"),
+        ge=1,
+        le=365,
+    )
     show_reference: bool = Field(
         default=True,
         description="除了最佳匹配，是否把其他候选也列出来。关掉后只发最佳匹配。",
@@ -667,6 +686,13 @@ def _reply_target(segments: list[dict], message: dict) -> str:
     return str(message.get("reply_to") or "").strip()
 
 
+def _as_bool(value: Any) -> bool:
+    """把工具参数转成布尔。模型偶尔会把 false 写成字符串。"""
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off", "none"}
+    return bool(value)
+
+
 def _decode_base64(value: str) -> bytes | None:
     payload = value.strip()
     if payload.startswith("base64://"):
@@ -794,10 +820,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._tasks: TaskStore | None = None
+        self._result_cache: resultcache.ResultCache | None = None
         self._pools: dict[str, KeyPool] = {}
         self._engines: dict[str, Any] = {}
         self._background: set[asyncio.Task] = set()
         self._pending: dict[tuple[str, str], float] = {}
+        # 等待补图时记住这次要不要无视缓存重搜（「盆地找鸡 重搜」后只发图）
+        self._pending_force: dict[tuple[str, str], bool] = {}
         self._pending_timers: dict[tuple[str, str], asyncio.Task] = {}
         # 合并转发节点的 uin 不能为空，否则 QQ 端会提示消息异常；从入站消息里记机器人账号。
         self._self_id: str = ""
@@ -898,6 +927,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             self._tasks = TaskStore(self.ctx.paths.data_dir, section.task_ttl_minutes * 60)
         else:
             self._tasks.set_ttl(section.task_ttl_minutes * 60)
+
+        self._result_cache = (
+            resultcache.ResultCache(
+                self.ctx.paths.data_dir,
+                ttl_seconds=max(1, section.cache_days) * 86400,
+            )
+            if section.cache_enabled
+            else None
+        )
 
         global_proxy = _proxy_of(section.proxy)
         self._pools = {
@@ -1058,12 +1096,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
     async def _start_from_pending(self, raw: bytes, key: tuple[str, str]) -> None:
         if self._pending.pop(key, None) is None:
             return
+        force = bool(self._pending_force.pop(key, False))
         timer = self._pending_timers.pop(key, None)
         if timer is not None:
             timer.cancel()
         current, user_id = key
         try:
-            self._start_task(raw, "", current, user_id, notify=True)
+            self._start_task(raw, "", current, user_id, notify=True, force=force)
         except Exception as error:  # noqa: BLE001
             self.ctx.logger.warning("等待窗口补图启动搜图失败：%s", error)
             await self.ctx.send.text(f"启动搜图失败：{error}", current)
@@ -1338,12 +1377,33 @@ class ImageSearcherPlugin(MaiBotPlugin):
             raise EngineError(f"未知引擎 {name}")
         return engine.search(image, image_url, stream_id)
 
-    async def _search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> SearchOutcome:
+    async def _search(self, raw: bytes, image_url: str = "", stream_id: str = "", force: bool = False) -> SearchOutcome:
         config = self.config
         section = config.plugin
         started = time.time()
         target_hash = dhash(raw)
         upload, _mime = prepare_upload(raw)
+
+        cache = self._result_cache
+        cache_key = ""
+        if cache is not None and upload:
+            cache_key = resultcache.cache_key(upload, ENGINES_VERSION)
+            hit = None if force else cache.get(cache_key)
+            if hit is not None:
+                outcome = SearchOutcome.from_summary(hit.payload)
+                outcome.cached = True
+                outcome.cached_at = hit.stored_at
+                outcome.image_b64, outcome.image_source = await self._best_image(
+                    outcome.best, outcome.candidates, upload
+                )
+                self._vlog(
+                    "按图缓存命中：状态=%s 候选=%s 存于=%s（%.1f 天前）",
+                    outcome.status,
+                    outcome.total_candidates,
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(hit.stored_at)),
+                    hit.age_seconds / 86400,
+                )
+                return outcome
 
         names = [name for name in config.engines.priority if self._enabled(name)]
         if not names:
@@ -1414,6 +1474,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             await self._verify(candidates, grouped, names, target_hash)
 
         ordered = self._rank(candidates, names, prefer_pixiv=sauce is not None)
+        # 同一个账号常被 Lens、Yandex、百度一起撞见：只留质量最好的那条，
+        # 免得参考区里同一个号重复列三遍。
+        ordered = dedupe_accounts(ordered)
         # 最佳匹配按指纹质量挑，不受引擎顺序影响；指纹距离优先，其次相似度。
         # 插画路线优先取 pixiv 的命中。
         best = self._pick_best(ordered, prefer_pixiv=sauce is not None)
@@ -1443,7 +1506,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     else:
                         grok_info = result
                 if vision_info and vision_info.get("picked"):
-                    ordered = self._rank(candidates, names)
+                    ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
                     # 画面本来就更像，比编号顺序更靠谱。
                     hits = [item for item in ordered if item.status == "vision"]
@@ -1503,6 +1566,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             outcome.image_source = "upload"
         elif best is not None or ordered or upload:
             outcome.image_b64, outcome.image_source = await self._best_image(best, ordered, upload)
+
+        # 写缓存：只存「搜到了」的结果。没找到的不存——实测同一张图过半天就能搜到，
+        # 存下来只会挡住后来才出现的原帖。Grok 依赖当天 X 上的内容，它的结论也不存。
+        cacheable = outcome.status == "ok" and outcome.best is not None
+        if cache is not None and cache_key and cacheable:
+            payload = outcome.to_summary()
+            payload.pop("grok", None)
+            cache.put(cache_key, payload)
+            self._vlog("按图缓存写入：状态=%s 条目=%s", outcome.status, cache.size)
         return outcome
 
     async def _verify(
@@ -1820,6 +1892,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "error": "",
             "tools": [],
             "hints": 0,
+            "verified": "unknown",
         }
         if upload is None:
             info["error"] = "没有原图，无法搜人"
@@ -1886,6 +1959,23 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     info["error"] = f"@{result.handle} 在 X 上查不到，已丢弃"
                     info["reason"] = info["error"]
 
+            if info["tier"] == "post" and info["post_url"]:
+                # 帖子里到底有没有这张图，不能只看模型给的链接：拉回来比指纹。
+                check = await self._verify_tweet(info["post_url"], upload)
+                info["verified"] = check["verdict"]
+                if check["verdict"] == "hit":
+                    note = f"帖子配图对得上（距离 {check['distance']}）"
+                    info["reason"] = f"{note}；{info['reason']}" if info["reason"] else note
+                elif check["verdict"] == "miss":
+                    note = f"帖子配图对不上（最近距离 {check['distance']}）"
+                    if info["handle"]:
+                        info["tier"] = "account"
+                        info["reason"] = f"{note}，只当账号线索"
+                    else:
+                        info["tier"] = "none"
+                        info["post_url"] = ""
+                        info["reason"] = f"{note}，已丢弃"
+
         self.ctx.logger.info(
             "Grok 兜底：档位=%s 账号=%s 帖子=%s 候选=%s 工具=%s 耗时=%.1fs 理由=%s%s",
             info["tier"],
@@ -1898,6 +1988,97 @@ class ImageSearcherPlugin(MaiBotPlugin):
             f" 错误={info['error']}" if info["error"] else "",
         )
         return info
+
+    async def _fetch_tweet(self, ref: str) -> fxtwitter.Tweet:
+        """按链接或 ID 拉一条推文的元数据（fxtwitter，不需要登录）。"""
+        tweet_id = fxtwitter.parse_tweet_id(ref)
+        if not tweet_id:
+            return fxtwitter.Tweet(error="没看出推文 ID")
+        url = fxtwitter.build_api_url(tweet_id)
+        proxy = self._proxy()
+        timeout = min(20, max(8, int(self.config.plugin.download_timeout) + 6))
+
+        def call() -> dict:
+            session = make_session(proxy, headers={"Accept": "application/json"})
+            try:
+                response = session.get(url, timeout=timeout)
+                if response.status_code != 200:
+                    raise HttpError(f"HTTP {response.status_code}")
+                return response.json()
+            finally:
+                session.close()
+
+        try:
+            payload = await asyncio.wait_for(asyncio.to_thread(call), timeout=timeout + 4)
+        except Exception as error:  # noqa: BLE001 - 拉不到就当核对失败，不影响主流程
+            return fxtwitter.Tweet(error=f"拉推文失败：{str(error)[:60]}", tweet_id=tweet_id)
+        return fxtwitter.parse_tweet(payload, tweet_id=tweet_id)
+
+    async def _verify_tweet(self, ref: str, upload: bytes | None) -> dict[str, Any]:
+        """把推文里的配图和用户原图做指纹比对。
+
+        返回 verdict：hit（同一张图）/ miss（不是这张）/ unknown（没下到图或解不出指纹）。
+        unknown 不能当成 miss——图床一次 403 就把真结果判死，比不核对更糟。
+        """
+        info: dict[str, Any] = {"verdict": "unknown", "distance": -1, "tweet": None, "error": ""}
+        if not upload:
+            info["error"] = "没有原图"
+            return info
+        tweet = await self._fetch_tweet(ref)
+        info["tweet"] = tweet
+        if not tweet.ok:
+            info["error"] = tweet.error
+            return info
+        if not tweet.media:
+            info["error"] = "这条帖子没有配图"
+            return info
+        mine = dhash(upload)
+        if mine is None:
+            info["error"] = "原图解不出指纹"
+            return info
+        distances: list[int] = []
+        for url in tweet.media[:4]:
+            raw = await self._download(url)
+            if not raw:
+                continue
+            other = dhash(raw)
+            if other is None:
+                continue
+            distances.append(hamming(mine, other))
+        info["verdict"] = fxtwitter.judge(distances, self.config.plugin.hash_threshold)
+        info["distance"] = min(distances) if distances else -1
+        if info["verdict"] == "unknown" and not info["error"]:
+            info["error"] = "配图一张都没下到"
+        self._vlog(
+            "推文核对：id=%s 作者=@%s 配图=%s 距离=%s 结论=%s",
+            tweet.tweet_id,
+            tweet.handle or "无",
+            len(tweet.media),
+            info["distance"],
+            info["verdict"],
+        )
+        return info
+
+    def _xid_reply(self, check: dict[str, Any]) -> str:
+        tweet: fxtwitter.Tweet | None = check.get("tweet")
+        threshold = self.config.plugin.hash_threshold
+        if tweet is None or not tweet.ok:
+            reason = check.get("error") or "拉不到这条帖子"
+            return f"❌ 核对失败：{reason}。链接或 ID 对不对？"
+        who = f"@{tweet.handle}" if tweet.handle else "未知账号"
+        if tweet.name:
+            who += f"（{tweet.name}）"
+        link = tweet.url or f"https://x.com/{tweet.handle}/status/{tweet.tweet_id}"
+        if check["verdict"] == "hit":
+            return (
+                f"✅ 对上了：这张图就是 {who} 这条帖子里的图，指纹距离 {check['distance']}。\n{link}"
+            )
+        if check["verdict"] == "miss":
+            return (
+                f"❌ 对不上：{who} 这条帖子的配图和你的图差得远，"
+                f"最近距离 {check['distance']}（阈值 {threshold}）。\n{link}"
+            )
+        return f"⚠️ 没法比对：{who} 这条帖子拉到了，但配图没取下来（{check.get('error') or '下载失败'}）。\n{link}"
 
     async def _account_exists(self, handle: str) -> bool | None:
         """查账号在 X 上是否存在。返回 None 表示没查成，不能当成「不存在」。"""
@@ -1952,7 +2133,16 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
     # -- 任务 -------------------------------------------------------------
 
-    def _start_task(self, raw: bytes, image_url: str, stream_id: str, user_id: str, *, notify: bool) -> SearchTask:
+    def _start_task(
+        self,
+        raw: bytes,
+        image_url: str,
+        stream_id: str,
+        user_id: str,
+        *,
+        notify: bool,
+        force: bool = False,
+    ) -> SearchTask:
         if self._tasks is None:
             raise RuntimeError("插件尚未初始化")
         if not self.config.plugin.enabled:
@@ -1961,24 +2151,25 @@ class ImageSearcherPlugin(MaiBotPlugin):
             raise RuntimeError("当前搜索任务太多，请稍后再试")
 
         task = self._tasks.new_task(stream_id, user_id)
-        background = asyncio.create_task(self._run_task(task, raw, image_url, notify))
+        background = asyncio.create_task(self._run_task(task, raw, image_url, notify, force))
         self._background.add(background)
         background.add_done_callback(self._background.discard)
         return task
 
-    async def _run_task(self, task: SearchTask, raw: bytes, image_url: str, notify: bool) -> None:
+    async def _run_task(self, task: SearchTask, raw: bytes, image_url: str, notify: bool, force: bool = False) -> None:
         try:
-            outcome = await self._search(raw, image_url, task.stream_id)
+            outcome = await self._search(raw, image_url, task.stream_id, force=force)
             if self._tasks:
                 self._tasks.finish(task, outcome)
             self._vlog(
-                "搜图完成：task=%s 状态=%s 路线=%s 候选=%s 引擎=%s 耗时=%sms 错误=%s",
+                "搜图完成：task=%s 状态=%s 路线=%s 候选=%s 引擎=%s 耗时=%sms 缓存=%s 错误=%s",
                 task.task_id,
                 outcome.status,
                 outcome.route,
                 outcome.total_candidates,
                 outcome.engine_counts,
                 outcome.elapsed_ms,
+                "是" if outcome.cached else "否",
                 outcome.errors or "无",
             )
             if outcome.best is not None:
@@ -2140,12 +2331,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
     def _pending_key(self, kwargs: dict, stream_id: str) -> tuple[str, str]:
         return (self._stream_id(kwargs) or stream_id, self._user_id(kwargs))
 
-    async def _wait_for_image(self, current: str, user_id: str, quoted: bool = False) -> None:
+    async def _wait_for_image(self, current: str, user_id: str, quoted: bool = False, force: bool = False) -> None:
         """指令没带图：提示一次，并在超时时间内接住用户补发的单图。"""
         key = (current, user_id)
         seconds = max(10, self.config.plugin.image_wait_seconds)
         self._pending[key] = time.time() + seconds
-        self._vlog("进入等待图片窗口：key=%s 秒数=%s 引用=%s", key, seconds, quoted)
+        self._pending_force[key] = bool(force)
+        self._vlog("进入等待图片窗口：key=%s 秒数=%s 引用=%s 重搜=%s", key, seconds, quoted, force)
         if quoted:
             # 引用消息里可能确实有图，但机器人这边没收到过那条消息，取不到只能请用户直接发。
             text = (
@@ -2172,6 +2364,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return
         if self._pending.pop(key, None) is None:
             return
+        self._pending_force.pop(key, None)
         self._pending_timers.pop(key, None)
         if not key[0]:
             return
@@ -2209,11 +2402,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 description="可选，本次搜索的备注，会写进日志",
                 required=False,
             ),
+            ToolParameterInfo(
+                name="force",
+                param_type=ToolParamType.BOOLEAN,
+                description=(
+                    "可选。为 true 时忽略按图缓存强制重搜；用户说「重搜」「重新查」「刚才那个再搜一遍」时用它。"
+                    "默认 false，同一张图搜过会直接返回上次结果。"
+                ),
+                required=False,
+            ),
         ],
     )
-    async def image_search(self, note: str = "", msg_id: str = "", **kwargs: Any) -> dict[str, Any]:
+    async def image_search(self, note: str = "", msg_id: str = "", force: bool = False, **kwargs: Any) -> dict[str, Any]:
         stream_id = self._stream_id(kwargs)
         user_id = self._user_id(kwargs)
+        forced = _as_bool(force)
         wanted = "".join(ch for ch in str(msg_id or "") if ch.isdigit())
         if wanted:
             # 模型点名了具体消息：直接按 ID 取，不受 3 分钟窗口限制。
@@ -2238,12 +2441,13 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return {"success": False, "content": message, "message": message}
 
         try:
-            task = self._start_task(raw, image_url, stream_id, user_id, notify=True)
+            task = self._start_task(raw, image_url, stream_id, user_id, notify=True, force=forced)
         except Exception as error:  # noqa: BLE001
             return {"success": False, "content": f"启动搜图失败：{error}", "message": str(error)}
 
         message = (
-            f"已开始搜索（task_id={task.task_id}，图片来源：{source}），预计 {self._eta_text()}。"
+            f"已开始搜索（task_id={task.task_id}，图片来源：{source}"
+            f"{'，已忽略缓存' if forced else ''}），预计 {self._eta_text()}。"
             f"结果会以合并转发发到聊天里；也可以用 search_status 凭 task_id 取文字摘要。"
         )
         self.ctx.logger.info("Tool 启动搜图：task=%s user=%s note=%s", task.task_id, user_id, note)
@@ -2348,6 +2552,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return False, "", 0
 
         self._pending.pop(key, None)
+        self._pending_force.pop(key, None)
         timer = self._pending_timers.pop(key, None)
         if timer is not None:
             timer.cancel()
@@ -2367,7 +2572,17 @@ class ImageSearcherPlugin(MaiBotPlugin):
         matched = kwargs.get("matched_groups") or {}
         arg = str(matched.get("arg") or "").strip()
 
+        # 「重搜」= 无视按图缓存，强制重新跑一遍引擎。写在最前面，后面还能跟「更多」。
+        force, arg = split_force(arg)
         head = (arg.split() or [""])[0]
+        # 「xid」= 拿一条已知推文来核对：帖子里的图和用户发的图是不是同一张。
+        xid_ref = ""
+        if head.lower() in {"xid", "核对", "推文"}:
+            parts = arg.split(maxsplit=1)
+            xid_ref = parts[1].strip() if len(parts) > 1 else ""
+        if force:
+            self._vlog("指令要求强制重搜：忽略按图缓存")
+
         if head in {"更多", "more", "全部"}:
             # 支持「更多 s-20261103-0832-d7d9」：群里同时有好几次搜索时靠编号定位。
             parts = arg.split(maxsplit=1)
@@ -2392,20 +2607,39 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
         raw, image_url, source, _stale = await self._resolve_image(kwargs)
         self._vlog("指令取图：来源=%s 体积=%sKB 链接=%s", source or "无", len(raw) // 1024 if raw else 0, (image_url or "无")[:80])
+
+        if head.lower() in {"xid", "核对", "推文"}:
+            if not xid_ref:
+                await self.ctx.send.text(
+                    f"把推文链接或 ID 写在后面，例如「{COMMAND} xid 2105595040806707433」。",
+                    current,
+                )
+                return True, "缺少推文 ID", 2
+            if not raw:
+                await self.ctx.send.text(
+                    f"核对要把图和指令发在同一条消息里：「{COMMAND} xid <链接或 ID>」。",
+                    current,
+                )
+                return True, "缺少图片", 2
+            check = await self._verify_tweet(xid_ref, raw)
+            await self.ctx.send.text(self._xid_reply(check), current)
+            return True, "核对完成", 2
+
         if not raw:
             message = kwargs.get("message")
             quoted = bool(_reply_target(_segments_of(message), message if isinstance(message, dict) else {}))
-            await self._wait_for_image(current, user_id, quoted=quoted)
+            await self._wait_for_image(current, user_id, quoted=quoted, force=force)
             return True, "等待图片", 2
 
         try:
-            task = self._start_task(raw, image_url, current, user_id, notify=True)
+            task = self._start_task(raw, image_url, current, user_id, notify=True, force=force)
         except Exception as error:  # noqa: BLE001
             await self.ctx.send.text(f"启动搜图失败：{error}", current)
             return False, str(error), 1
 
         await self.ctx.send.text(
-            f"🔍 正在搜图（{source}），{self._eta_text()}，结果稍后以合并转发发出。",
+            f"🔍 正在搜图（{source}{'，已忽略缓存' if force else ''}），"
+            f"{self._eta_text()}，结果稍后以合并转发发出。",
             current,
         )
         return True, "搜图中", 2
