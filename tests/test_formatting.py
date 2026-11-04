@@ -9,6 +9,7 @@ from core.engines import Candidate
 from core.formatting import (
     build_engine_forward_nodes,
     build_forward_nodes,
+    build_result_forwards,
     build_text_summary,
     engine_groups,
     stale_image_hint,
@@ -484,6 +485,86 @@ class TwoSuggestionsTest(unittest.TestCase):
         groups = engine_groups(outcome, outcome.best, 8)
         flat = [item for _, items in groups for item in items]
         self.assertIn(outcome.best, flat)
+
+
+class SplitForwardsTest(unittest.TestCase):
+    """视觉、Grok、页脚各自成一条，方便对照，不再挤在同一条转发里。"""
+
+    def _make_outcome(self, *, with_grok: bool = True, best: bool = True) -> SearchOutcome:
+        item = Candidate(
+            engine="baidu",
+            url="https://www.douyin.com/note/123",
+            distance=27,
+            status="vision",
+            note="视觉复核：同一个人（距离 27）",
+            handle="someone",
+        )
+        item.finalize()
+        outcome = SearchOutcome(
+            status="ok",
+            best=item if best else None,
+            candidates=[item],
+            image_b64="VISIMG",
+            image_source=item.image_url,
+            grok={
+                "ok": True,
+                "tier": "account" if with_grok else "none",
+                "handle": "someone",
+                "post_url": "https://x.com/someone/status/1",
+                "reference_url": "https://pbs.twimg.com/media/AAA.jpg",
+                "distance": 25,
+                "reason": "帖子配图对不上（最近距离 25），帖子只当参考",
+            }
+            if with_grok
+            else None,
+        )
+        outcome.grok_image_b64 = "GROKIMG"
+        return outcome
+
+    def test_vision_and_grok_split_into_three_messages(self) -> None:
+        blocks = build_result_forwards(_task(self._make_outcome()), command="盆地找鸡")
+        self.assertEqual(len(blocks), 3)
+
+        vision_text = blocks[0][0]["content"][0]["content"]
+        self.assertIn("视觉复核认为是同一个人", vision_text)
+        self.assertIn("可能认错", vision_text)
+        self.assertEqual(
+            [p["content"] for p in blocks[0][0]["content"] if p["type"] == "image"], ["VISIMG"]
+        )
+
+        grok_text = "\n".join(
+            part["content"] for part in blocks[1][0]["content"] if part["type"] == "text"
+        )
+        self.assertIn("Grok 核对", grok_text)
+        self.assertIn("someone", grok_text)
+        self.assertIn("不是同一张", grok_text)
+        self.assertEqual(
+            [p["content"] for p in blocks[1][0]["content"] if p["type"] == "image"], ["GROKIMG"]
+        )
+
+        footer = blocks[2][0]["content"][0]["content"]
+        self.assertIn("任务编号", footer)
+
+    def test_not_found_with_grok_keeps_footer_block_separate(self) -> None:
+        outcome = self._make_outcome(best=False)
+        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        self.assertEqual(len(blocks), 2)
+        # Grok 单独一条，尾部那条只讲「没找到」和参考区，不再重复 Grok 结论。
+        tail = "\n".join(
+            part["content"]
+            for node in blocks[1]
+            for part in node.get("content") or []
+            if part["type"] == "text"
+        )
+        self.assertIn("未找到可靠出处", tail)
+        self.assertNotIn("X 搜索指向这个账号", tail)
+        self.assertIn("任务编号", tail)
+
+    def test_no_fallback_content_stays_single_message(self) -> None:
+        outcome = self._make_outcome(with_grok=False, best=False)
+        outcome.grok = {"ok": True, "tier": "none", "error": ""}
+        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        self.assertEqual(len(blocks), 1)
 
 
 if __name__ == "__main__":

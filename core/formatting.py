@@ -69,16 +69,16 @@ def _grok_lines(grok: dict) -> list[str]:
     return []
 
 
-def _best_block(outcome: SearchOutcome) -> str:
+def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     best = outcome.best
     grok = outcome.grok or {}
     grok_lines = _grok_lines(grok)
     # 帖子档高于视觉档：帖子能点开对照，视觉只是模型判断，所以先给帖子。
-    if grok.get("tier") == "post":
+    if grok.get("tier") == "post" and not skip_grok:
         if best is not None and best.status == "vision":
             grok_lines.append("视觉复核也认为是同一个人（模型判断，仅供参考），那张候选见参考区。")
         return "\n".join(grok_lines)
-    if best is None and grok_lines:
+    if best is None and grok_lines and not skip_grok:
         # 只拿到账号：比「完全没找到」有用，但没有帖子可对照，仍然算线索。
         vision = outcome.vision or {}
         if vision.get("ok") and vision.get("checked"):
@@ -110,7 +110,7 @@ def _best_block(outcome: SearchOutcome) -> str:
                 lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
         elif vision.get("error"):
             lines.append(f"视觉复核没做完：{vision['error']}")
-        if grok:
+        if grok and not skip_grok:
             if grok.get("error") and grok.get("tier") != "none":
                 lines.append(f"Grok 找人没做完：{grok['error']}")
             elif grok.get("error"):
@@ -373,6 +373,186 @@ def build_forward_nodes(
     )
 
     return nodes
+
+
+def _node(content: list[dict], nickname: str, user_id: str) -> dict:
+    item: dict = {"nickname": nickname, "content": content}
+    if user_id:
+        item["user_id"] = user_id
+    return item
+
+
+def _vision_block(outcome: SearchOutcome) -> list[dict] | None:
+    """视觉复核命中时单独一块：结论 + 它挑中的那张图。"""
+    best = outcome.best
+    if best is None or best.status != "vision":
+        return None
+    lines = ["🧠 没找到同一张图，但视觉复核认为是同一个人", *_identity_lines(best)]
+    lines.append("⚠️ 这条是视觉模型挑的，不是指纹比对，可能认错，请自行核对。")
+    content: list[dict] = [{"type": "text", "content": "\n".join(lines)}]
+    if outcome.image_b64:
+        content.append({"type": "image", "content": outcome.image_b64})
+    return content
+
+
+def _grok_block(outcome: SearchOutcome) -> list[dict] | None:
+    """Grok 有结论时单独一块：账号/帖子 + 帖子配图里最接近的一张。"""
+    grok = outcome.grok or {}
+    if grok.get("tier") not in {"post", "account"}:
+        return None
+    lines = ["🔎 Grok 核对（X）", *_grok_lines(grok)]
+    best = outcome.best
+    if best is not None and best.status == "vision":
+        lines.append("👀 视觉复核也挑了一条，见上一条。")
+    content: list[dict] = [{"type": "text", "content": "\n".join(lines)}]
+
+    grok_ref = str(grok.get("reference_url") or "")
+    image = ""
+    hint = ""
+    distance: int | None = None
+    if outcome.grok_image_b64:
+        image = outcome.grok_image_b64
+        hint = "📋 Grok 帖子配图里跟原图最接近的一张"
+        gap = grok.get("distance")
+        if isinstance(gap, int) and gap >= 0:
+            distance = gap
+    elif outcome.image_b64 and grok_ref and outcome.image_source == grok_ref:
+        image = outcome.image_b64
+        hint = "📋 参考图（Grok 帖子配图里跟原图最接近的一张）"
+        distance = _reference_distance(outcome, grok_ref)
+
+    if image:
+        gap_text = f"指纹距离 {distance}，" if distance is not None else ""
+        content.append({"type": "text", "content": f"{hint}（{gap_text}不是同一张）"})
+        content.append({"type": "image", "content": image})
+    return content
+
+
+def _tail_nodes(
+    task: SearchTask,
+    outcome: SearchOutcome,
+    *,
+    command: str,
+    show_reference: bool,
+    limit: int,
+    nickname: str,
+    ttl_minutes: int,
+    replay: bool,
+    user_id: str,
+    grok_taken: bool,
+) -> list[dict]:
+    """最后一条：没找到时给结论、参考图和参考区，然后统一收尾。"""
+    nodes: list[dict] = []
+    if outcome.best is None:
+        # Grok 已经单独占一条时，这里不要再重复它的结论。
+        nodes.append(
+            _node(
+                [{"type": "text", "content": _best_block(outcome, skip_grok=grok_taken)}],
+                nickname,
+                user_id,
+            )
+        )
+        grok_ref = str((outcome.grok or {}).get("reference_url") or "")
+        grok_gave_image = grok_taken and outcome.image_source == grok_ref
+        if outcome.image_b64 and not grok_gave_image:
+            distance = _reference_distance(outcome, outcome.image_source)
+            gap = f"，指纹距离 {distance}" if distance is not None else ""
+            if grok_ref and outcome.image_source == grok_ref:
+                hint = f"📋 参考图（Grok 帖子配图里跟原图最接近的一张{gap}，不是同一张）"
+            else:
+                hint = f"📋 参考图（候选里跟原图最接近的一张{gap}，不是同一张）"
+            nodes.append(
+                _node(
+                    [
+                        {"type": "text", "content": hint},
+                        {"type": "image", "content": outcome.image_b64},
+                    ],
+                    nickname,
+                    user_id,
+                )
+            )
+        if show_reference:
+            for engine, items in engine_groups(outcome, outcome.best, limit):
+                content: list[dict] = [
+                    {"type": "text", "content": f"▍{_engine_name(engine)}（{len(items)} 条）"}
+                ]
+                for index, item in enumerate(items, start=1):
+                    content.append({"type": "text", "content": _candidate_text(item, index)})
+                    image = candidate_image(outcome, item)
+                    if image:
+                        content.append({"type": "image", "content": image})
+                nodes.append(_node(content, nickname, user_id))
+
+    nodes.append(
+        _node(
+            [
+                {
+                    "type": "text",
+                    "content": "\n".join(_footer_lines(outcome, command, ttl_minutes, replay, task.task_id)),
+                }
+            ],
+            nickname,
+            user_id,
+        )
+    )
+    return nodes
+
+
+def build_result_forwards(
+    task: SearchTask,
+    *,
+    command: str,
+    show_reference: bool = True,
+    limit: int = 8,
+    nickname: str = "麦麦寻人",
+    ttl_minutes: int = 15,
+    replay: bool = False,
+    user_id: str = "",
+) -> list[list[dict]]:
+    """把结果拆成几条转发：视觉一条、Grok 一条、页脚一条。
+
+    视觉的结果和图、Grok 的结果和图各占一条，页脚（任务编号、更多、重搜）
+    单独一条。两边都没内容时返回原来的单条结构，避免无谓地多发消息。
+    """
+    outcome = task.outcome or SearchOutcome(status="error")
+
+    blocks: list[list[dict]] = []
+    vision = _vision_block(outcome)
+    if vision:
+        blocks.append([_node(vision, nickname, user_id)])
+    grok = _grok_block(outcome)
+    if grok:
+        blocks.append([_node(grok, nickname, user_id)])
+
+    if not blocks:
+        return [
+            build_forward_nodes(
+                task,
+                command=command,
+                show_reference=show_reference,
+                limit=limit,
+                nickname=nickname,
+                ttl_minutes=ttl_minutes,
+                replay=replay,
+                user_id=user_id,
+            )
+        ]
+
+    blocks.append(
+        _tail_nodes(
+            task,
+            outcome,
+            command=command,
+            show_reference=show_reference,
+            limit=limit,
+            nickname=nickname,
+            ttl_minutes=ttl_minutes,
+            replay=replay,
+            user_id=user_id,
+            grok_taken=bool(grok),
+        )
+    )
+    return blocks
 
 
 def build_engine_forward_nodes(

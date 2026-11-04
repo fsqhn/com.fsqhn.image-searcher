@@ -338,11 +338,18 @@ class VisionConfig(PluginConfigBase):
         ),
     )
     timeout: int = Field(
-        default=90,
-        description="一次视觉复核最多等多少秒，超时就放弃，不影响已经搜到的文字结果。",
-        json_schema_extra=_ui("超时（秒）", "默认 90。图片多、模型慢时可以调大。"),
+        default=180,
+        description=(
+            "一次视觉复核最多等多少秒，超时就放弃，不影响已经搜到的文字结果。"
+            "这个值是「排队 + 推理」的总时长：宿主在跑记忆整理之类的任务时，视觉请求"
+            "可能先排几十秒才轮到模型，所以不要按模型本身的耗时来设。"
+        ),
+        json_schema_extra=_ui(
+            "超时（秒）",
+            "默认 180。宿主繁忙时视觉请求要排队，90 秒容易在轮到模型前就被放弃。",
+        ),
         ge=10,
-        le=300,
+        le=600,
     )
 
 
@@ -1517,6 +1524,24 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         vision_info = result
                     else:
                         grok_info = result
+                if vision_info is not None:
+                    if vision_info.get("error"):
+                        self.ctx.logger.warning(
+                            "视觉复核未完成：%s（检查=%s 耗时=%ss 模型=%s）",
+                            vision_info["error"],
+                            vision_info.get("checked"),
+                            vision_info.get("elapsed"),
+                            vision_info.get("model") or config.vision.model or config.vision.task,
+                        )
+                    else:
+                        self._vlog(
+                            "视觉复核：检查=%s 命中=%s 降级=%s 耗时=%ss 模型=%s",
+                            vision_info.get("checked"),
+                            len(vision_info.get("picked") or []),
+                            vision_info.get("downgraded"),
+                            vision_info.get("elapsed"),
+                            vision_info.get("model") or "-",
+                        )
                 if vision_info and vision_info.get("picked"):
                     ordered = dedupe_accounts(self._rank(candidates, names))
                     # 模型可能一次报好几格，取指纹距离最近的那条当结论——距离近说明
@@ -1775,6 +1800,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
         明是视觉复核、没有指纹依据，不能当成「同一张图」发出去。
         """
         section = self.config.vision
+        started = time.monotonic()
         info: dict[str, Any] = {
             "ok": False,
             "checked": 0,
@@ -1783,6 +1809,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "reason": "",
             "model": "",
             "error": "",
+            "elapsed": 0.0,
         }
         if upload is None:
             info["error"] = "没有原图，无法复核"
@@ -1859,15 +1886,31 @@ class ImageSearcherPlugin(MaiBotPlugin):
             )
         except asyncio.TimeoutError:
             info["error"] = f"视觉模型 {timeout} 秒内没返回"
+            info["elapsed"] = round(time.monotonic() - started, 1)
+            # 这个超时多半是「排队」而不是模型慢：宿主同时跑记忆整理之类的重任务时，
+            # 视觉请求要等几十秒才轮到。日志里留下等待时长，方便判断该调 timeout 还是查宿主。
+            self.ctx.logger.warning(
+                "视觉复核超时：等待=%.1fs 超时=%ss 候选=%s 模型=%s",
+                info["elapsed"],
+                timeout,
+                len(images),
+                section.model or section.task,
+            )
             return info
         except Exception as error:  # noqa: BLE001
             info["error"] = f"视觉模型调用失败：{str(error)[:80]}"
+            info["elapsed"] = round(time.monotonic() - started, 1)
+            self.ctx.logger.warning("视觉复核调用失败：耗时=%.1fs err=%s", info["elapsed"], error)
             return info
 
         # call_capability 可能已经把结果解包成字符串，两种形态都要接住。
         payload = result if isinstance(result, dict) else {"success": True, "response": str(result or "")}
+        info["elapsed"] = round(time.monotonic() - started, 1)
         if not payload.get("success", True):
             info["error"] = f"视觉模型返回失败：{str(payload.get('error'))[:80]}"
+            self.ctx.logger.warning(
+                "视觉复核返回失败：耗时=%.1fs err=%s", info["elapsed"], payload.get("error")
+            )
             return info
         info["ok"] = True
         info["checked"] = len(images)
@@ -2370,30 +2413,64 @@ class ImageSearcherPlugin(MaiBotPlugin):
             if len(groups) > 1 and self._planned_images(outcome, groups) > self._MAX_FORWARD_IMAGES:
                 await self._send_engine_forwards(task, groups, section)
                 return
-        nodes = formatting.build_forward_nodes(
-            task,
-            command=COMMAND,
-            show_reference=section.show_reference,
-            limit=limit,
-            nickname=section.nickname,
-            ttl_minutes=section.task_ttl_minutes,
-            replay=replay,
-            user_id=self._self_id or "0",
-        )
-        try:
-            sent = await self.ctx.send.forward(nodes, task.stream_id)
+        if replay:
+            # 「更多」是重发全部候选，保持单条结构（图多时会走上面的按引擎拆条）。
+            blocks = [
+                formatting.build_forward_nodes(
+                    task,
+                    command=COMMAND,
+                    show_reference=section.show_reference,
+                    limit=limit,
+                    nickname=section.nickname,
+                    ttl_minutes=section.task_ttl_minutes,
+                    replay=replay,
+                    user_id=self._self_id or "0",
+                )
+            ]
+        else:
+            # 视觉、Grok 各自一条，页脚（任务编号、更多、重搜）单独一条：
+            # 两种来源的结论和配图挤在一条里，用户分不清哪张属于哪个判断。
+            blocks = formatting.build_result_forwards(
+                task,
+                command=COMMAND,
+                show_reference=section.show_reference,
+                limit=limit,
+                nickname=section.nickname,
+                ttl_minutes=section.task_ttl_minutes,
+                replay=replay,
+                user_id=self._self_id or "0",
+            )
+
+        delivered = 0
+        last_error: Exception | None = None
+        for index, nodes in enumerate(blocks, start=1):
+            try:
+                sent = await self.ctx.send.forward(nodes, task.stream_id)
+            except Exception as error:  # noqa: BLE001 - 一块失败不影响后面的块
+                last_error = error
+                self.ctx.logger.warning("合并转发失败：块=%s/%s err=%s", index, len(blocks), error)
+                continue
             self._vlog(
-                "合并转发已发送：task=%s replay=%s 节点=%s 图=%s 返回类型=%s",
+                "合并转发已发送：task=%s replay=%s 块=%s/%s 节点=%s 图=%s 返回类型=%s 成功=%s",
                 task.task_id,
                 replay,
+                index,
+                len(blocks),
                 len(nodes),
                 sum(1 for item in nodes for part in item.get("content") or [] if part.get("type") == "image"),
                 type(sent).__name__,
+                _send_ok(sent),
             )
-            if not _send_ok(sent):
-                raise RuntimeError(f"合并转发被拒绝：{sent}")
-        except Exception as error:  # noqa: BLE001
-            self.ctx.logger.warning("合并转发失败，退回文字消息：%s", error)
+            if _send_ok(sent):
+                delivered += 1
+            else:
+                self.ctx.logger.warning("合并转发被拒绝：块=%s/%s", index, len(blocks))
+            if index < len(blocks):
+                # 连着发多条容易被适配器判成刷屏，隔一秒。
+                await asyncio.sleep(1)
+
+        if delivered == 0:
+            self.ctx.logger.warning("合并转发全部失败，退回文字消息：%s", last_error or "被拒绝")
             text = formatting.build_text_summary(
                 task,
                 command=COMMAND,
