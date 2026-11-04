@@ -170,6 +170,7 @@ python -m unittest discover -s tests -v
 
 ## 发布前检查
 
+- **`host_application.max_version` 不能写 999.999.999**：插件市场的校验规则是前两位不能为 99 或 999，写错不会报错，只会把 Release 静默记进 `plugin_versions.json` 的 `rejected_releases`，市场索引永远停在最后一个通过的版本。现在写 `1.9.999`（第三位不限）。改完拿市场仓库的 `.github/scripts/validate_manifest.cjs` 跑一遍 `collectManifestErrors(manifest, {historical:false})`，确认零错误再发版。
 - `config.toml` 不要提交；确认仓库里只有 `config.example.toml`。
 - 仓库内不要留 `plugin.py.upload_tmp`、`__pycache__`、日志、任务数据与缓存文件（`image_searcher_cache.json`）。
 - 不要在 README / AGENTS / 代码里出现真实 key、代理 IP、群号。
