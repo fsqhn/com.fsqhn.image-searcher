@@ -43,7 +43,7 @@ class BuildPayloadTest(unittest.TestCase):
     def test_prompt_forbids_guessing(self) -> None:
         body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA")
         text = body["input"][0]["content"][0]["text"]
-        self.assertIn("没找到", text)
+        self.assertIn("只找到账号不算完成", text)
         self.assertIn("不要根据水印猜", text)
 
     def test_prompt_requires_image_search_when_hints_miss(self) -> None:
@@ -137,12 +137,38 @@ class ParseOutputTest(unittest.TestCase):
         # 正文里裸写的账号名不能当成账号，必须带链接。
         self.assertEqual(result.post_url, "")
 
-    def test_reserved_paths_ignored(self) -> None:
-        body = _body("参考 https://x.com/i/status/1234567890 和 https://x.com/home ，都不是。")
+    def test_internal_status_link_keeps_the_tweet_id(self) -> None:
+        """x.com/i/status/<id> 没有作者名，但 status id 是真的，能反查出作者。"""
+        posts = grok.find_posts("参考 https://x.com/i/status/1234567890 这条", [])
+        self.assertEqual(posts, [("", "https://x.com/i/status/1234567890")])
+        result = grok.parse_output(_body("https://x.com/i/status/1234567890"))
+        self.assertEqual(result.tier, "post")
+        # 不能把 "i" 当成账号名发出去。
+        self.assertEqual(result.handle, "")
+        self.assertEqual(result.post_url, "https://x.com/i/status/1234567890")
+
+    def test_other_reserved_paths_ignored(self) -> None:
+        self.assertEqual(grok.find_posts("https://x.com/home/status/1234567890", []), [])
+        self.assertEqual(grok.find_posts("https://x.com/search/status/1234567890", []), [])
+        self.assertEqual(grok.find_posts("https://x.com/home", []), [])
+
+    def test_all_candidate_posts_are_kept(self) -> None:
+        """模型列了好几条帖子时都要留着，插件逐条比指纹，别只信第一条。"""
+        body = _body(
+            "https://x.com/a_one/status/1111111111\n"
+            "https://x.com/a_two/status/2222222222\n"
+            "https://x.com/i/status/3333333333"
+        )
         result = grok.parse_output(body)
-        # x.com/i/status/... 里的 i 是保留路径，不能当账号。
-        self.assertNotEqual(result.handle, "i")
-        self.assertEqual(result.tier, "none")
+        self.assertEqual(result.post_url, "https://x.com/a_one/status/1111111111")
+        self.assertEqual(
+            [url for _handle, url in result.posts],
+            [
+                "https://x.com/a_one/status/1111111111",
+                "https://x.com/a_two/status/2222222222",
+                "https://x.com/i/status/3333333333",
+            ],
+        )
 
     def test_empty_output(self) -> None:
         result = grok.parse_output({"output": []})
@@ -172,6 +198,43 @@ class ParseOutputTest(unittest.TestCase):
     def test_reason_fallback_strips_links(self) -> None:
         self.assertEqual(grok.reason_of(""), "")
         self.assertIn("同款", grok.reason_of("看起来是同款 https://x.com/a/status/1234567890 的人"))
+
+
+class PickBestCheckTest(unittest.TestCase):
+    """Grok 给了多条帖子、逐条比完指纹之后，选哪条当结论。"""
+
+    def test_hit_wins_even_when_it_is_not_the_first(self) -> None:
+        checks = [
+            {"verdict": "miss", "distance": 12},
+            {"verdict": "hit", "distance": 3},
+        ]
+        self.assertEqual(grok.pick_best_check(checks)["verdict"], "hit")
+
+    def test_no_hit_falls_back_to_the_closest(self) -> None:
+        checks = [
+            {"verdict": "miss", "distance": 30},
+            {"verdict": "miss", "distance": 20},
+            {"verdict": "unknown", "distance": -1},
+        ]
+        self.assertEqual(grok.pick_best_check(checks)["distance"], 20)
+
+    def test_distance_zero_counts_as_usable(self) -> None:
+        """距离 0 是完美命中，不能被当成「没有距离」丢掉。"""
+        checks = [
+            {"verdict": "unknown", "distance": -1},
+            {"verdict": "miss", "distance": 0},
+        ]
+        self.assertEqual(grok.pick_best_check(checks)["distance"], 0)
+
+    def test_all_unknown_keeps_the_first(self) -> None:
+        checks = [
+            {"verdict": "unknown", "distance": -1},
+            {"verdict": "unknown", "distance": -1},
+        ]
+        self.assertIs(grok.pick_best_check(checks), checks[0])
+
+    def test_empty_returns_none(self) -> None:
+        self.assertIsNone(grok.pick_best_check([]))
 
 
 class FormattingTest(unittest.TestCase):

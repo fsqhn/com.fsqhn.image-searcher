@@ -22,25 +22,27 @@ PROMPT_TEMPLATE = """有人在找这张图的出处。
 然后用 X 搜索找出这张照片的发布者。
 
 要求：
-1. 找到原帖就给帖子地址；只能确认到账号就给账号主页；都对不上就说没找到。
-2. 必须真的搜过再回答。不要根据水印猜，也不要给出你没在搜索结果里见到的账号。
-3. 判断依据要写清楚：你搜了什么、看到哪些账号、为什么认为是这个人。
-4. 结尾单独一行写「依据：」，用不超过 40 个字说明关键证据。
-5. 候选都对不上时，必须把这张图本身作为检索输入再去 X 搜一次（以图找人）；只拿文字关键词搜过就回「没找到」，算没完成任务——自己拍的照片往往搜不到关键词，只能靠图。
+1. 目标是原帖：能定位到具体帖子就写帖子地址。有多条看着像的帖子就全部列出来，一条一行，最多 8 条——后面会逐条比对图片指纹，宁可多给，不要只给一条。
+2. 只找到账号不算完成。出现「某个号像她」的念头时，必须先按第 6 条拿这张图本身再搜一次，确认这个号确实发过这张图、或者确实找不到原帖，才能收工。
+3. 必须真的搜过再回答。不要根据水印猜，也不要给出你没在搜索结果里见到的账号。
+4. 判断依据要写清楚：你搜了什么、看到哪些账号、为什么认为是这个人。
+5. 结尾单独一行写「依据：」，用不超过 40 个字说明关键证据；如果最后只剩账号没有帖子，要在这里写明「已用图搜过，未见原帖」。
+6. 以图找人是关键手段：候选清单都对不上、或者只对上一个名字时，把这张图本身作为检索输入再去 X 搜一次。只拿文字关键词搜过就交差，算没完成任务——自己拍的照片往往搜不到关键词，只能靠图。
 
 输出格式：
 账号：@xxx
 帖子：https://x.com/xxx/status/1234567890
+帖子：https://x.com/xxx/status/1234567891
 依据：不超过 40 字
 
-只能确认到账号时，帖子一行写「无」。完全找不到时，账号一行写「无」，并在依据里说明搜了什么、没有结果。
+帖子写「无」只允许出现在「已经以图搜过、确实没有原帖」的情况下。只对上一个名字、没拿图搜过就写「无」，不算完成。完全找不到时，账号一行也写「无」，并在依据里说明搜了什么、没有结果。
 """
 
 HINT_BLOCK = """搜索引擎这边已经返回了这些候选（账号 | 平台 | 标题）：
 {hints}
 
 请先把这些候选逐个和画面对比，看哪一个是这张图真正的发布者——找到就直接给它的帖子地址。
-这些都对不上，就按第 5 条拿这张图本身去 X 搜索找人，不要只换几个关键词再试。
+只对上名字不算对上人，按第 2 条先拿这张图本身去 X 搜索核对，别停在一个同名账号上。
 """
 
 
@@ -127,6 +129,8 @@ class GrokResult:
     tier: str = "none"
     post_url: str = ""
     handle: str = ""
+    # Grok 一次可能给出多条看着像的帖子，全部留着逐条比指纹，别只信第一条。
+    posts: list[tuple[str, str]] = field(default_factory=list)
     reason: str = ""
     text: str = ""
     model: str = ""
@@ -199,17 +203,25 @@ def collect_text_and_urls(body: dict) -> tuple[str, list[str], list[str]]:
 
 
 def find_posts(text: str, urls: list[str]) -> list[tuple[str, str]]:
-    """按出现顺序收集帖子链接，返回 [(handle, url)]，去重保序。"""
+    """按出现顺序收集帖子链接，返回 [(handle, url)]，去重保序。
+
+    ``x.com/i/status/<id>`` 是 X 自己的内部跳转链接，拿不到账号名，但 status
+    id 是真的，fxtwitter 能顺着它解析出真实作者。Grok 从搜索结果里抓到的常常
+    就是这种形式，整类丢掉会把最有用的一批线索扔掉，所以单独保留，handle 记空。
+    """
     seen: set[str] = set()
     found: list[tuple[str, str]] = []
     for blob in [text, *urls]:
         for match in _STATUS.finditer(blob or ""):
             handle = match.group("handle")
-            # x.com/i/status/... 是 X 自己的内部跳转链接，不是某个账号发的帖子。
-            if handle.lower() in RESERVED:
-                continue
             sid = match.group("sid")
             if sid in seen:
+                continue
+            if handle.lower() in RESERVED:
+                if handle.lower() != "i":
+                    continue
+                seen.add(sid)
+                found.append(("", f"https://x.com/i/status/{sid}"))
                 continue
             seen.add(sid)
             found.append((handle, f"https://x.com/{handle}/status/{sid}"))
@@ -241,6 +253,23 @@ def find_accounts(text: str, urls: list[str]) -> list[str]:
     return found
 
 
+def pick_best_check(checks: list[dict]) -> dict | None:
+    """多条候选帖子里挑一条：命中优先，其次指纹距离最近的，全都没下到图就取第一条。
+
+    Grok 可能一次给出好几条看着像的帖子，逐条比过指纹之后，得由这里决定用哪条
+    当结论。命中（距离 ≤ 阈值）是唯一的硬判据，没有命中才退回「谁最近」。
+    """
+    if not checks:
+        return None
+    for check in checks:
+        if check.get("verdict") == "hit":
+            return check
+    usable = [check for check in checks if (check.get("distance") if check.get("distance") is not None else -1) >= 0]
+    if usable:
+        return min(usable, key=lambda check: check["distance"])
+    return checks[0]
+
+
 def reason_of(text: str) -> str:
     """取「依据：」那一行；模型没按格式写就退化成去掉链接后的开头。"""
     if not text:
@@ -270,6 +299,7 @@ def parse_output(body: dict, *, model: str = "") -> GrokResult:
     posts = find_posts(text, urls)
     result.reason = reason_of(text)
     if posts:
+        result.posts = posts
         handle, url = posts[0]
         result.ok = True
         result.tier = "post"

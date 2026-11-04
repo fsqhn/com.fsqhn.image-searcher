@@ -48,6 +48,14 @@ class BuildPromptTest(unittest.TestCase):
         self.assertIn("同一个人", prompt)
         self.assertIn("same_person", prompt)
 
+    def test_prompt_allows_candidates_without_a_visible_face(self):
+        """很多目标图只有腿或局部，提示词不能要求必须看到脸。"""
+        prompt = vision.build_prompt(16)
+        self.assertIn("看不到脸", prompt)
+        # 真正的门槛是个体化证据，而不是脸。
+        self.assertIn("不算证据", prompt)
+        self.assertIn("角色名", prompt)
+
     def test_prompt_braces_are_rendered(self):
         """模板里的 JSON 示例用双花括号转义，渲染后应剩单花括号。"""
         prompt = vision.build_prompt(3)
@@ -58,14 +66,15 @@ class BuildPromptTest(unittest.TestCase):
 class BuildGridTest(unittest.TestCase):
     def test_target_is_slot_zero_and_layout_matches_counts(self):
         grid = vision.build_grid(_sample(1), [_sample(i) for i in range(1, 17)])
-        self.assertAlmostEqual(grid.width, 5 * 224 + 6 * 4, delta=1)
-        self.assertAlmostEqual(grid.height, 4 * 224 + 5 * 4, delta=1)
+        # 4 列 320：17 格排 5 行，每格比原来 5 列 224 大一倍多。
+        self.assertAlmostEqual(grid.width, 4 * 320 + 5 * 4, delta=1)
+        self.assertAlmostEqual(grid.height, 5 * 320 + 6 * 4, delta=1)
         self.assertTrue(grid.data.startswith(b"\xff\xd8"))
 
-    def test_twenty_five_candidates_take_five_rows(self):
+    def test_twenty_five_candidates_take_seven_rows(self):
         grid = vision.build_grid(_sample(1), [_sample(i) for i in range(1, 26)])
-        self.assertLessEqual(grid.width, 1200)
-        self.assertGreater(grid.height, grid.width)
+        self.assertAlmostEqual(grid.width, 4 * 320 + 5 * 4, delta=1)
+        self.assertAlmostEqual(grid.height, 7 * 320 + 8 * 4, delta=1)
 
     def test_broken_candidate_keeps_its_slot(self):
         """解不开的图占一格灰块，编号不能往前挪，否则模型报的编号会错位。"""
@@ -184,6 +193,30 @@ class VisionDisplayTest(unittest.TestCase):
         self.assertTrue(vision.is_traceable("", "pixiv.net", ""))
         self.assertFalse(vision.is_traceable("", "aliexpress.ru", "https://aliexpress.ru/item/1"))
         self.assertFalse(vision.is_traceable("", "某论坛", "https://example.com/thread/9"))
+
+    def test_verdict_requires_an_account_not_just_a_platform_page(self):
+        """抖音 note 这类只有平台页面、没有账号的，不能当结论发出去。"""
+        self.assertEqual(
+            vision.verdict_of("", "抖音", "http://www.douyin.com/note/7512413636004220179"),
+            vision.VERDICT_NO_ACCOUNT,
+        )
+        self.assertEqual(
+            vision.verdict_of("@someone", "X (Twitter)", "https://x.com/someone/status/1"),
+            vision.VERDICT_VISION,
+        )
+        self.assertEqual(
+            vision.verdict_of("", "aliexpress.ru", "https://aliexpress.ru/item/1"),
+            vision.VERDICT_COMMERCE,
+        )
+        self.assertEqual(
+            vision.verdict_of("", "某论坛", "https://example.com/thread/9"),
+            vision.VERDICT_UNTRACEABLE,
+        )
+        # 电商优先：卖同款衣服的商品页，即使带着平台也不会变成可核对的结论。
+        self.assertEqual(
+            vision.verdict_of("", "taobao.com", "https://item.taobao.com/item.htm?id=1"),
+            vision.VERDICT_COMMERCE,
+        )
 
     def test_not_found_reports_downgraded_picks(self):
         """视觉挑中的都被降级时，不能说「没有发现同一个人」。"""

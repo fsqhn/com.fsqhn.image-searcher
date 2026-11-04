@@ -315,8 +315,8 @@ class VisionConfig(PluginConfigBase):
     )
     top_n: int = Field(
         default=16,
-        description="视觉复核时拼前几张候选。16 张是 4 行 5 列，25 张是 5 行 5 列。格数越多越慢、越容易看错。",
-        json_schema_extra=_ui("拼几张候选", "默认 16。拼 25 张更全，但小图更难分辨，也更费时间。"),
+        description="视觉复核时拼前几张候选，4 列排布，每格 320 像素。格数越多越慢、越容易看错。",
+        json_schema_extra=_ui("拼几张候选", "默认 16。格子越大越能看清细节，但格数太多会拖慢并增加看错风险。"),
         ge=4,
         le=25,
     )
@@ -1280,8 +1280,20 @@ class ImageSearcherPlugin(MaiBotPlugin):
         best 为空（没找到可靠出处）时照样给一张参考图，方便用户核对是不是同一张；
         候选全失败时退回用户原图；没有原图（比如重放磁盘恢复的任务）就返回空。
         """
+        if best is not None:
+            pool = [best, *ordered]
+        else:
+            # 没找到可靠出处时，配图要取候选里跟原图最接近的那张，不能按引擎顺序
+            # 拿第一条——那样「参考图」看起来就像随手抓的，跟相似度没关系。
+            pool = sorted(
+                ordered,
+                key=lambda item: (
+                    item.distance is None,
+                    item.distance if item.distance is not None else 999,
+                ),
+            )
         urls: list[str] = []
-        for item in [best, *ordered]:
+        for item in pool:
             if item is None:
                 continue
             if item.image_url and item.image_url not in urls:
@@ -1559,13 +1571,39 @@ class ImageSearcherPlugin(MaiBotPlugin):
         )
 
         if grok_hit and best is None and upload:
-            # Grok 给的帖子不在候选池里，索引也未必指得对；这时候用原图当参考图，
-            # 比随便抓一张距离最近的候选图更诚实。
-            compact, _ = prepare_upload(upload, limit=1_200_000, as_jpeg=True)
-            outcome.image_b64 = base64.b64encode(compact).decode("ascii")
-            outcome.image_source = "upload"
+            # Grok 给的帖子不在候选池里。核对时距离最近的那张最有用——用户可以直接
+            # 拿它跟原图肉眼比，比再放一次原图有意义。没这张（只给账号、图没下到）
+            # 才退回原图。
+            ref_url = str((grok_info or {}).get("reference_url") or "")
+            ref_raw = await self._download(ref_url) if ref_url else None
+            compact = None
+            if ref_raw:
+                try:
+                    compact, _ = prepare_upload(ref_raw, limit=1_200_000, as_jpeg=True)
+                except Exception:  # noqa: BLE001 - 解不开就用原图
+                    compact = None
+            if compact is not None:
+                outcome.image_b64 = base64.b64encode(compact).decode("ascii")
+                outcome.image_source = ref_url
+            else:
+                compact, _ = prepare_upload(upload, limit=1_200_000, as_jpeg=True)
+                outcome.image_b64 = base64.b64encode(compact).decode("ascii")
+                outcome.image_source = "upload"
         elif best is not None or ordered or upload:
             outcome.image_b64, outcome.image_source = await self._best_image(best, ordered, upload)
+
+        # 视觉和 Grok 各自挑出一张时，两张都给：视觉那张已经是 best 的首图，
+        # 这里补上 Grok 帖子配图里最近的一张，方便一眼对照。
+        grok_ref = str((grok_info or {}).get("reference_url") or "")
+        if grok_ref and best is not None and outcome.image_source != grok_ref:
+            ref_raw = await self._download(grok_ref)
+            if ref_raw:
+                try:
+                    compact, _ = prepare_upload(ref_raw, limit=1_200_000, as_jpeg=True)
+                except Exception:  # noqa: BLE001 - 解不开就不给第二张
+                    compact = None
+                if compact is not None:
+                    outcome.grok_image_b64 = base64.b64encode(compact).decode("ascii")
 
         # 写缓存：只存「搜到了」的结果。没找到的不存——实测同一张图过半天就能搜到，
         # 存下来只会挡住后来才出现的原帖。Grok 依赖当天 X 上的内容，它的结论也不存。
@@ -1724,6 +1762,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
     # -- 视觉兜底 ---------------------------------------------------------
 
     _VISION_DOWNLOAD_CONCURRENCY = 4
+    # Grok 一次列出的候选帖子上限。每条都要拉 fxtwitter 再下载配图，核多了会拖
+    # 慢整单，8 条够用又不至于卡住；命中就提前停，全不中才会跑满。
+    _GROK_MAX_POSTS = 8
+
 
     async def _vision_review(self, upload: bytes | None, ordered: list[Candidate]) -> dict[str, Any]:
         """指纹一条都没通过时，拼一张对照图交给视觉模型找「同一个人」。
@@ -1846,15 +1888,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 else "未做指纹比对"
             )
             # 视觉说「同一个人」还不够，得能落到人身上：电商商品图只是同款衣服，
-            # 没有账号的结果也没法核对，两种都降级成疑似，留在参考区。
-            if vision.is_commerce(candidate.platform, candidate.url, candidate.name):
+            # 只有平台页面没账号的结果也确认不了是谁，都降级成疑似留在参考区。
+            verdict = vision.verdict_of(candidate.handle, candidate.platform, candidate.url, candidate.name)
+            if verdict != vision.VERDICT_VISION:
                 candidate.status = "suspect"
-                candidate.note = f"视觉复核：疑似同一个人，但来自电商商品页（{gap}），仅供参考"
-                info["downgraded"] += 1
-                continue
-            if not vision.is_traceable(candidate.handle, candidate.platform, candidate.url):
-                candidate.status = "suspect"
-                candidate.note = f"视觉复核：疑似同一个人，但找不到可核对的账号（{gap}），仅供参考"
+                candidate.note = vision.DOWNGRADE_NOTES[verdict].format(gap=gap)
                 info["downgraded"] += 1
                 continue
             candidate.status = "vision"
@@ -1887,12 +1925,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "tier": "none",
             "handle": "",
             "post_url": "",
+            "reference_url": "",
             "reason": "",
             "model": "",
             "error": "",
             "tools": [],
             "hints": 0,
             "verified": "unknown",
+            # 核对时跟原图最接近的那张配图的指纹距离，参考图文案里要用。
+            "distance": -1,
         }
         if upload is None:
             info["error"] = "没有原图，无法搜人"
@@ -1961,26 +2002,57 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
             if info["tier"] == "post" and info["post_url"]:
                 # 帖子里到底有没有这张图，不能只看模型给的链接：拉回来比指纹。
-                check = await self._verify_tweet(info["post_url"], upload)
-                info["verified"] = check["verdict"]
-                if check["verdict"] == "hit":
+                # Grok 可能给出好几条看着像的帖子，逐条核，谁对上算谁——只看
+                # 第一条的话，它挑错一条整单就废了。
+                refs = [info["post_url"]]
+                if result.posts:
+                    refs = [url for _handle, url in result.posts[: self._GROK_MAX_POSTS]]
+                checks: list[dict[str, Any]] = []
+                for url in refs:
+                    current = await self._verify_tweet(url, upload)
+                    if current["verdict"] == "unknown":
+                        # 图床一次 403、代理抖一下，就会把真原帖判成 unknown。
+                        # 多条核对时漏掉一条就前功尽弃，这里补核一次。
+                        self._vlog("帖子核对没下到图，重试一次：%s", url)
+                        current = await self._verify_tweet(url, upload)
+                    checks.append(current)
+                    if current["verdict"] == "hit":
+                        break
+                info["checked_posts"] = len(checks)
+                check = grok.pick_best_check(checks)
+                # x.com/i/status/<id> 这种内部链接没有作者名，核对时 fxtwitter 会
+                # 解析出真实作者，回填进去，后面 miss 分支才认得出这是个活账号。
+                tweet = (check or {}).get("tweet")
+                if tweet is not None and getattr(tweet, "ok", False) and getattr(tweet, "handle", ""):
+                    if not info["handle"]:
+                        info["handle"] = tweet.handle
+                        info["post_url"] = f"https://x.com/{tweet.handle}/status/{tweet.tweet_id}"
+                info["verified"] = check["verdict"] if check else "unknown"
+                if check is not None:
+                    info["distance"] = check["distance"]
+                if check is not None and check["verdict"] == "hit":
                     note = f"帖子配图对得上（距离 {check['distance']}）"
                     info["reason"] = f"{note}；{info['reason']}" if info["reason"] else note
-                elif check["verdict"] == "miss":
+                elif check is not None and check["verdict"] == "miss":
                     note = f"帖子配图对不上（最近距离 {check['distance']}）"
                     if info["handle"]:
+                        # 帖子留着当「存疑参考」：账号多半是对的，配图可能是同一套
+                        # 的另一张。但不能说成原帖——同景同角色换个人拍，指纹也这样。
                         info["tier"] = "account"
-                        info["reason"] = f"{note}，只当账号线索"
+                        info["reason"] = f"{note}，帖子只当参考"
+                        # 核对时最接近的那张，拿来当参考图，用户可以直接肉眼比。
+                        info["reference_url"] = check.get("closest_url") or ""
                     else:
                         info["tier"] = "none"
                         info["post_url"] = ""
                         info["reason"] = f"{note}，已丢弃"
 
         self.ctx.logger.info(
-            "Grok 兜底：档位=%s 账号=%s 帖子=%s 候选=%s 工具=%s 耗时=%.1fs 理由=%s%s",
+            "Grok 兜底：档位=%s 账号=%s 帖子=%s 核对=%s 候选=%s 工具=%s 耗时=%.1fs 理由=%s%s",
             info["tier"],
             info["handle"] or "无",
             info["post_url"] or "无",
+            info.get("checked_posts", 0),
             info["hints"],
             ",".join(info["tools"]) or "无",
             time.time() - started,
@@ -2037,6 +2109,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
             info["error"] = "原图解不出指纹"
             return info
         distances: list[int] = []
+        closest_url = ""
+        closest_distance = 999
         for url in tweet.media[:4]:
             raw = await self._download(url)
             if not raw:
@@ -2044,9 +2118,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
             other = dhash(raw)
             if other is None:
                 continue
-            distances.append(hamming(mine, other))
+            distance = hamming(mine, other)
+            distances.append(distance)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_url = url
         info["verdict"] = fxtwitter.judge(distances, self.config.plugin.hash_threshold)
         info["distance"] = min(distances) if distances else -1
+        info["closest_url"] = closest_url
         if info["verdict"] == "unknown" and not info["error"]:
             info["error"] = "配图一张都没下到"
         self._vlog(

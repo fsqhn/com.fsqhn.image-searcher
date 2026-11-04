@@ -32,6 +32,9 @@ class SearchOutcome:
     total_candidates: int = 0
     image_b64: str = ""
     image_source: str = ""
+    # 视觉和 Grok 同时命中时，best 那张是视觉挑的；Grok 帖子配图里最近的一张单独放这儿。
+    # 只留在内存里，落盘不保存。
+    grok_image_b64: str = ""
     # 视觉兜底的执行情况：{"ok", "checked", "picked": [候选图地址], "reason", "model", "error"}。
     # 只在指纹一条都没命中时才有值，落盘保留，重放时也能说清当时复核了什么。
     vision: dict | None = None

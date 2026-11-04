@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from core.engines import Candidate
@@ -328,6 +329,161 @@ class StaleImageHintTest(unittest.TestCase):
 
     def test_under_one_minute_rounds_up(self) -> None:
         self.assertIn("1 分钟", stale_image_hint(30))
+
+
+class GrokReferenceTest(unittest.TestCase):
+    """Grok 给的帖子配图对不上时，链接仍要放出来，但必须标明是存疑参考。"""
+    def test_account_tier_keeps_post_as_reference(self) -> None:
+        outcome = SearchOutcome(
+            status="ok",
+            best=None,
+            candidates=[],
+            grok={
+                "tier": "account",
+                "handle": "mian84232594",
+                "post_url": "https://x.com/mian84232594/status/1",
+                "reason": "帖子配图对不上（最近距离 28），帖子只当参考",
+            },
+            total_candidates=0,
+        )
+        text = build_text_summary(_task(outcome), command="盆地找鸡")
+        self.assertIn("没核到原帖", text)
+        self.assertIn("存疑参考", text)
+        self.assertIn("https://x.com/mian84232594/status/1", text)
+        self.assertIn("请自行核对", text)
+
+    def test_account_without_post_has_no_reference_line(self) -> None:
+        outcome = SearchOutcome(
+            status="ok",
+            best=None,
+            candidates=[],
+            grok={"tier": "account", "handle": "catxiu233", "post_url": "", "reason": "名字对上了"},
+            total_candidates=0,
+        )
+        text = build_text_summary(_task(outcome), command="盆地找鸡")
+        self.assertIn("catxiu233", text)
+        self.assertNotIn("存疑参考", text)
+
+    def test_reference_image_comes_from_closest_tweet_photo(self) -> None:
+        """Grok 帖子核对失败时，参考图用帖子里距离最近的那张，并说明来源。"""
+        ref = "https://pbs.twimg.com/media/abc.jpg"
+        outcome = SearchOutcome(
+            status="ok",
+            best=None,
+            candidates=[],
+            grok={
+                "tier": "account",
+                "handle": "mian84232594",
+                "post_url": "https://x.com/mian84232594/status/1",
+                "reference_url": ref,
+                "distance": 20,
+                "reason": "帖子配图对不上（最近距离 20），帖子只当参考",
+            },
+            image_b64="AAAA",
+            image_source=ref,
+            total_candidates=0,
+        )
+        nodes = build_forward_nodes(_task(outcome), command="盆地找鸡")
+        blob = json.dumps(nodes, ensure_ascii=False)
+        self.assertIn("Grok 帖子配图里跟原图最接近", blob)
+        # 距离要写在图上，免得把这张图当成结论。
+        self.assertIn("指纹距离 20", blob)
+        self.assertIn("不是同一张", blob)
+
+    def test_reference_image_reports_candidate_distance(self) -> None:
+        """参考图来自候选池时，也要标出它跟原图的距离。"""
+        item = Candidate(
+            engine="lens",
+            url="https://example.com/a",
+            image_url="https://img/a.jpg",
+            distance=22,
+            status="mismatch",
+        )
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[item],
+            image_b64="AAAA",
+            image_source="https://img/a.jpg",
+            total_candidates=1,
+        )
+        nodes = build_forward_nodes(_task(outcome), command="盆地找鸡")
+        blob = json.dumps(nodes, ensure_ascii=False)
+        self.assertIn("候选里跟原图最接近的一张", blob)
+        self.assertIn("指纹距离 22", blob)
+
+    def test_footer_explains_grok_reference_image(self) -> None:
+        ref = "https://pbs.twimg.com/media/abc.jpg"
+        outcome = SearchOutcome(
+            status="ok",
+            best=None,
+            candidates=[],
+            grok={"tier": "account", "handle": "x", "post_url": "https://x.com/x/status/1",
+                  "reference_url": ref, "reason": "对不上"},
+            image_b64="AAAA",
+            image_source=ref,
+            total_candidates=0,
+        )
+        nodes = build_forward_nodes(_task(outcome), command="盆地找鸡")
+        blob = json.dumps(nodes, ensure_ascii=False)
+        self.assertIn("Grok 给的帖子里跟原图最接近的一张", blob)
+
+
+class TwoSuggestionsTest(unittest.TestCase):
+    """视觉和 Grok 同时给出结论时，两张图都要发。"""
+
+    def _make_outcome(self, with_grok_image: bool) -> SearchOutcome:
+        best = Candidate(
+            engine="lens",
+            url="https://x.com/a/status/1",
+            distance=6,
+            status="vision",
+            image_url="https://img/vision.jpg",
+        )
+        return SearchOutcome(
+            status="ok",
+            best=best,
+            candidates=[best],
+            image_b64="VIS",
+            image_source="https://img/vision.jpg",
+            grok_image_b64="GROK" if with_grok_image else "",
+            grok={
+                "tier": "account",
+                "handle": "someone",
+                "post_url": "https://x.com/someone/status/2",
+                "reference_url": "https://img/grok.jpg",
+                "reason": "帖子配图对不上（最近距离 20），帖子只当参考",
+            },
+            total_candidates=1,
+        )
+
+    def test_both_images_are_sent(self) -> None:
+        nodes = build_forward_nodes(_task(self._make_outcome(True)), command="盆地找鸡")
+        images = [
+            part.get("content")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "image"
+        ]
+        self.assertIn("VIS", images)
+        self.assertIn("GROK", images)
+
+    def test_only_vision_image_when_grok_has_none(self) -> None:
+        nodes = build_forward_nodes(_task(self._make_outcome(False)), command="盆地找鸡")
+        images = [
+            part.get("content")
+            for node in nodes
+            for part in node.get("content") or []
+            if part.get("type") == "image"
+        ]
+        self.assertEqual(images, ["VIS"])
+
+    def test_vision_best_stays_in_reference_groups(self) -> None:
+        """结论说「见参考区」，那条就得真的在参考区里。"""
+        outcome = self._make_outcome(False)
+        groups = engine_groups(outcome, outcome.best, 8)
+        flat = [item for _, items in groups for item in items]
+        self.assertIn(outcome.best, flat)
 
 
 if __name__ == "__main__":

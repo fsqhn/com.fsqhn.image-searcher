@@ -59,6 +59,10 @@ def _grok_lines(grok: dict) -> list[str]:
         lines = ["🔎 X 搜索指向这个账号，但没核到原帖"]
         if grok.get("handle"):
             lines.append(f"🔗 https://x.com/{grok['handle']}")
+        if grok.get("post_url"):
+            # 帖子配图指纹对不上：账号多半是对的，帖子可能是同一套的另一张。
+            # 只给链接，不说成原帖——同景同角色换个人拍，指纹也会这样。
+            lines.append(f"🔗 存疑参考（配图相似但非同图，可能是同一套的另一张，请自行核对）：{grok['post_url']}")
         if reason:
             lines.append(f"🔍 依据：{reason}")
         return lines
@@ -80,7 +84,7 @@ def _best_block(outcome: SearchOutcome) -> str:
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
                 grok_lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，但都是电商商品页或没有可核对的账号，只当参考。"
+                    f"视觉复核挑出 {vision['downgraded']} 条，但都没有可核对的账号（电商商品页或只有平台页面），只当参考。"
                 )
             else:
                 grok_lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
@@ -100,7 +104,7 @@ def _best_block(outcome: SearchOutcome) -> str:
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
                 lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，但都是电商商品页或没有可核对的账号，只当参考。"
+                    f"视觉复核挑出 {vision['downgraded']} 条，但都没有可核对的账号（电商商品页或只有平台页面），只当参考。"
                 )
             else:
                 lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
@@ -170,7 +174,9 @@ def engine_groups(
     """
     groups: dict[str, list[Candidate]] = {}
     for item in outcome.candidates:
-        if item is best:
+        # 视觉挑中的那条也要留在参考区，结论里「那张候选见参考区」才对得上号；
+        # 指纹命中时 best 已经在结论里给过，不必重复列。
+        if item is best and (best is None or best.status != "vision"):
             continue
         groups.setdefault(item.engine, []).append(item)
     result: list[tuple[str, list[Candidate]]] = []
@@ -222,6 +228,25 @@ def ttl_text(minutes: int) -> str:
     return f"{minutes} 分钟"
 
 
+def _reference_distance(outcome: SearchOutcome, source: str) -> int | None:
+    """参考图跟原图的指纹距离。
+
+    先按图片地址在候选里找；Grok 参考图不在候选里时，用它核对时记下的最近
+    距离。取不到就返回 None，文案里就不写距离。
+    """
+    if not source:
+        return None
+    for item in outcome.candidates:
+        if item.image_url and item.image_url == source and item.distance is not None:
+            return item.distance
+    grok = outcome.grok or {}
+    if str(grok.get("reference_url") or "") == source:
+        distance = grok.get("distance")
+        if isinstance(distance, int) and distance >= 0:
+            return distance
+    return None
+
+
 def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool, task_id: str = "") -> list[str]:
     lines = [_route_line(outcome), _ai_line(outcome.ai)]
     if outcome.cached:
@@ -230,7 +255,13 @@ def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay
     if outcome.image_b64 and outcome.image_source == "upload":
         lines.append("（候选图都没取到，转发里的图是你发的原图）")
     elif outcome.image_b64 and outcome.best is None:
-        lines.append("（参考区那张是相似度最高的候选，未经指纹确认）")
+        grok_ref = str((outcome.grok or {}).get("reference_url") or "")
+        distance = _reference_distance(outcome, outcome.image_source)
+        suffix = f"，指纹距离 {distance}，不是同一张" if distance is not None else "，未经指纹确认"
+        if grok_ref and outcome.image_source == grok_ref:
+            lines.append(f"（参考图是 Grok 给的帖子里跟原图最接近的一张{suffix}）")
+        else:
+            lines.append(f"（参考区那张是候选里跟原图最接近的一张{suffix}）")
     if outcome.errors:
         failed = "、".join(f"{name}（{message[:40]}）" for name, message in outcome.errors.items())
         lines.append(f"⚠️ 未返回结果的引擎：{failed}")
@@ -283,12 +314,33 @@ def build_forward_nodes(
         best_content.append({"type": "image", "content": outcome.image_b64})
     nodes.append(node(best_content))
 
-    # 没找到可靠出处时，先单独给一张参考图，方便用户自己核对是不是同一张。
-    if outcome.best is None and outcome.image_b64:
+    # 视觉和 Grok 都挑出了东西时，两张图并排给：结论里一句「Grok 那边也有个号」
+    # 不如图直接摆出来好判断。
+    if outcome.grok_image_b64:
+        grok_gap = (outcome.grok or {}).get("distance")
+        gap_text = f"，指纹距离 {grok_gap}" if isinstance(grok_gap, int) and grok_gap >= 0 else ""
         nodes.append(
             node(
                 [
-                    {"type": "text", "content": "📋 参考图（未经指纹确认）"},
+                    {"type": "text", "content": f"📋 Grok 帖子配图里跟原图最接近的一张{gap_text}（配图非同图，仅供参考）"},
+                    {"type": "image", "content": outcome.grok_image_b64},
+                ]
+            )
+        )
+
+    # 没找到可靠出处时，先单独给一张参考图，方便用户自己核对是不是同一张。
+    if outcome.best is None and outcome.image_b64:
+        grok_ref = str((outcome.grok or {}).get("reference_url") or "")
+        distance = _reference_distance(outcome, outcome.image_source)
+        gap = f"，指纹距离 {distance}" if distance is not None else ""
+        if grok_ref and outcome.image_source == grok_ref:
+            hint = f"📋 参考图（Grok 帖子配图里跟原图最接近的一张{gap}，不是同一张）"
+        else:
+            hint = f"📋 参考图（候选里跟原图最接近的一张{gap}，不是同一张）"
+        nodes.append(
+            node(
+                [
+                    {"type": "text", "content": hint},
                     {"type": "image", "content": outcome.image_b64},
                 ]
             )

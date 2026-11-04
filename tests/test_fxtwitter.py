@@ -21,6 +21,13 @@ class ParseTweetIdTest(unittest.TestCase):
     def test_bare_id(self) -> None:
         self.assertEqual(fxtwitter.parse_tweet_id("2105595040806707433"), "2105595040806707433")
 
+    def test_internal_link_without_handle(self) -> None:
+        """x.com/i/status/<id> 是 Grok 最常给的形式，也得能取出 ID。"""
+        self.assertEqual(
+            fxtwitter.parse_tweet_id("https://x.com/i/status/2104951546119410067"),
+            "2104951546119410067",
+        )
+
     def test_short_number_is_not_an_id(self) -> None:
         self.assertEqual(fxtwitter.parse_tweet_id("12345"), "")
 

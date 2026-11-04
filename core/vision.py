@@ -21,8 +21,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .extract import is_social_platform
 
-GRID_COLS = 5
-CELL_SIZE = 224
+GRID_COLS = 4
+CELL_SIZE = 320
 GAP = 4
 BACKGROUND = (46, 46, 46)
 PLACEHOLDER = (86, 86, 86)
@@ -36,14 +36,23 @@ PROMPT_TEMPLATE = """你在帮我核对「同一个人」。
 
 第 0 格是目标图，标着 TARGET；第 1 到第 {count} 格是搜索引擎返回的候选，每格左上角标着编号。
 
-请找出候选里哪些和 TARGET 是同一个人。判断依据是人本身：脸型、五官、发型、身材、气质，以及明显属于这个人的特征（同一套衣服、同一处纹身、同一个配饰）。
-同一个人换了姿势、换了角度、被裁掉一部分、被别人拼成对比图、加上水印或滤镜、换了背景，都算同一个人。
-反过来要排除：同一个角色、同一套 cos 服，但明显是另一个人的，不算同一个人。
-特别注意：电商商品图、模特展示图、商品详情页截图，即使衣服鞋子一模一样，也不算同一个人——那只是同款商品，不是同一个人。
+请找出候选里哪些和 TARGET 是同一个人。
+
+图里经常看不到脸——只露腿、只有背影、只截了半身，这很正常，照样要判断。按图里能看到的部分找「属于这一个具体的人」的证据：
+- 有脸时：脸型、五官形状、五官之间的比例；
+- 没脸时：局部本身的可辨识细节，比如纹身、痣、疤、指甲与手型、腿型与皮肤特征、某一侧耳朵上的饰品、发长与发尾处理、衣物上特定图案的位置与磨损、鞋袜的穿法、拍摄现场里少见又重复出现的物件。
+
+下面这些不算证据，只靠它们必须返回空数组：
+- 角色名、作品名——同一个角色谁都能 cos；
+- 同款服装、发色、体型、姿势、构图、背景墙这类描述——换个人穿同样成立。
+判断标准就一句：把这条理由放到任何一张同角色同款的图上都成立，那它就是没证据。
+
+另外要排除：电商商品图、模特展示图、商品详情页截图，即使衣服鞋子一模一样，也不算同一个人——那只是同款商品，不是同一个人。
+同一个人换了姿势、换了角度、被裁掉一部分、被别人拼成对比图、加了水印或滤镜、换了背景，都算同一个人。
 拿不准的不要选，宁缺毋滥。
 
 只输出一行 JSON，不要任何解释与代码块：
-{{"same_person": [编号], "reason": "不超过 30 字的判断依据"}}
+{{"same_person": [编号], "reason": "不超过 40 字，写你看到的那个具体特征"}}
 一个都不是就输出：
 {{"same_person": [], "reason": "..."}}
 """
@@ -131,6 +140,36 @@ def is_traceable(handle: str = "", platform: str = "", url: str = "") -> bool:
     if str(handle or "").strip():
         return True
     return is_social_platform(url=url, source=platform)
+
+
+# 视觉说「同一个人」之后，这条结果还能到什么程度。顺序有意义：先排电商商品页，
+# 再看能不能追踪，最后确认有没有账号名。
+VERDICT_VISION = "vision"
+VERDICT_COMMERCE = "commerce"
+VERDICT_UNTRACEABLE = "untraceable"
+VERDICT_NO_ACCOUNT = "no_account"
+
+DOWNGRADE_NOTES = {
+    VERDICT_COMMERCE: "视觉复核：疑似同一个人，但来自电商商品页（{gap}），仅供参考",
+    VERDICT_UNTRACEABLE: "视觉复核：疑似同一个人，但找不到可核对的账号（{gap}），仅供参考",
+    VERDICT_NO_ACCOUNT: "视觉复核：疑似同一个人，但只找到平台页面、没有账号可核对（{gap}），仅供参考",
+}
+
+
+def verdict_of(handle: str = "", platform: str = "", url: str = "", name: str = "") -> str:
+    """视觉命中之后，这条候选能到什么档。
+
+    只落在社交平台页面上、却没解析出账号名的（比如一条抖音 note 链接），点进去
+    也确认不了是谁发的，只能算疑似——之前这类被当成结论发出去，用户看到的
+    「找到了」其实只是同场景的另一条内容。
+    """
+    if is_commerce(platform, url, name):
+        return VERDICT_COMMERCE
+    if not is_traceable(handle, platform, url):
+        return VERDICT_UNTRACEABLE
+    if not str(handle or "").strip():
+        return VERDICT_NO_ACCOUNT
+    return VERDICT_VISION
 
 
 
