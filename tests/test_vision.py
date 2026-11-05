@@ -273,8 +273,42 @@ class VisionDisplayTest(unittest.TestCase):
         )
         text = formatting._best_block(outcome)
         self.assertIn("3", text)
-        self.assertIn("只当参考", text)
+        self.assertIn("不能当作者主页", text)
         self.assertNotIn("没有发现同一个人", text)
+
+    def test_downgraded_pick_prints_its_link(self):
+        """降级不等于没搜到：最近那条的链接要直接放进结论。"""
+        item = Candidate(
+            engine="lens",
+            url="https://hentaiera.com/gallery/1741778/",
+            platform="hentaiera.com",
+            status="suspect",
+            distance=18,
+            note="视觉复核：疑似同一个人，但那是hentaiera.com上的页面、不是作者主页（指纹距离 18）",
+        )
+        outcome = SearchOutcome(
+            status="not_found",
+            candidates=[item],
+            vision={"ok": True, "checked": 16, "picked": [], "downgraded": 1, "reason": "银发与吊带位置一致"},
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("最接近的一条", text)
+        self.assertIn("https://hentaiera.com/gallery/1741778/", text)
+        # 已经单独给过链接的，不再混进「同角色或同款服装」
+        self.assertNotIn("同角色或同款服装", text)
+
+    def test_plain_suspects_still_listed(self):
+        """不是视觉挑中的疑似条目，仍然要留在「同角色或同款服装」里。"""
+        item = Candidate(
+            engine="lens",
+            url="https://example.com/other",
+            status="suspect",
+            distance=26,
+            note="指纹不符（距离 26）",
+        )
+        outcome = SearchOutcome(status="not_found", candidates=[item])
+        text = formatting._best_block(outcome)
+        self.assertIn("同角色或同款服装", text)
 
 
 if __name__ == "__main__":

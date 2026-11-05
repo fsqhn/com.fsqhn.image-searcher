@@ -187,6 +187,28 @@ def _vision_reason(vision: dict | None) -> str:
     return f"🧠 它给的理由：{reason[:80]}"
 
 
+def _vision_pick_line(outcome: SearchOutcome) -> str:
+    """视觉挑中又降级时，把最近那条的链接直接放到结论里。
+
+    降级说的是「这页不能当作者主页」，不是「没搜到」：这条往往就是这张图所在的
+    作品页、图库页。只写一句「只当参考」时，群里得点开参考区逐条找，看着就像
+    什么都没给。
+    """
+    picks = [
+        item
+        for item in outcome.candidates
+        if item.status == "suspect"
+        and (item.note or "").startswith("视觉复核")
+        and item.url
+    ]
+    if not picks:
+        return ""
+    pick = min(picks, key=lambda item: item.distance if item.distance is not None else 999)
+    where = pick.platform or pick.source or pick.engine
+    gap = f"，指纹距离 {pick.distance}" if pick.distance is not None else ""
+    return f"👉 最接近的一条（{where}{gap}）\n{pick.url}"
+
+
 def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     text = _best_block_core(outcome, skip_grok=skip_grok)
     extra: list[str] = []
@@ -217,11 +239,14 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
                 grok_lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，但落点是电商商品页或音乐站、图库站这类页面，不是作者主页，只当参考。"
+                    f"视觉复核挑出 {vision['downgraded']} 条，落点是图库站、漫画站或商品页这类页面，不能当作者主页；其中最近的一条可能就包含这张图。"
                 )
                 reason_line = _vision_reason(vision)
                 if reason_line:
                     grok_lines.append(reason_line)
+                pick_line = _vision_pick_line(outcome)
+                if pick_line:
+                    grok_lines.append(pick_line)
             else:
                 grok_lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
         elif vision.get("error"):
@@ -230,7 +255,13 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     if best is None:
         compared = sum(1 for item in outcome.candidates if item.distance is not None)
         highest = max((item.distance or 0 for item in outcome.candidates), default=0)
-        suspects = [item for item in outcome.candidates if item.status == "suspect"]
+        # 视觉挑中又降级的条目上面已经单独说明并给了链接，不再算进「同角色或
+        # 同款服装」——同一批图不能既说「像同一个人」又说「不是这张照片」。
+        suspects = [
+            item
+            for item in outcome.candidates
+            if item.status == "suspect" and not (item.note or "").startswith("视觉复核")
+        ]
         lines = ["⚠️ 未找到可靠出处"]
         if compared:
             lines.append(f"已比对 {compared} 条候选，最高指纹距离 {highest}，均未通过阈值。")
@@ -240,11 +271,14 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
                 lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，但落点是电商商品页或音乐站、图库站这类页面，不是作者主页，只当参考。"
+                    f"视觉复核挑出 {vision['downgraded']} 条，落点是图库站、漫画站或商品页这类页面，不能当作者主页；其中最近的一条可能就包含这张图。"
                 )
                 reason_line = _vision_reason(vision)
                 if reason_line:
                     lines.append(reason_line)
+                pick_line = _vision_pick_line(outcome)
+                if pick_line:
+                    lines.append(pick_line)
             else:
                 lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
         elif vision.get("error"):
