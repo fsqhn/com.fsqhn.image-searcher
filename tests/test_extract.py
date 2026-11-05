@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core import extract  # noqa: E402
 from core.extract import (  # noqa: E402
     account_key,
     canonical_account_url,
@@ -56,10 +57,26 @@ class ExtractIdentityTest(unittest.TestCase):
         _name, handle = extract_identity("https://www.douyin.com/user/MS4wLjABAAAA", "某人")
         self.assertEqual(handle, "@MS4wLjABAAAA")
 
+    def test_x_post_title_name_drops_body(self) -> None:
+        """正文里的词不能当名字：``Happy Halloween!`` 曾推出 @halloween。"""
+        self.assertEqual(
+            extract.x_title_name('kiko on X: "Happy Halloween!" / X'), "kiko"
+        )
+        self.assertEqual(extract.x_title_name("普通标题"), "普通标题")
+
     def test_no_identity(self) -> None:
         name, handle = extract_identity("https://example.com/gallery/9", "一张相册图")
         self.assertEqual(handle, "")
         self.assertEqual(name, "一张相册图")
+
+    def test_x_post_title_keeps_only_name(self) -> None:
+        """X 帖子的标题是「名字 on X: "正文"」，正文不能当名字发出去。"""
+        name, handle = extract_identity(
+            "https://x.com/YuMIkAnime/status/2117959676180701586",
+            '□카🕯 on X: "그러니까 중국 사이트 듣도보도못한 계정 찾아서 ...',
+        )
+        self.assertEqual(name, "□카🕯")
+        self.assertEqual(handle, "@YuMIkAnime")
 
 
 class AccountPageTest(unittest.TestCase):
@@ -161,9 +178,46 @@ class PlatformTest(unittest.TestCase):
         self.assertEqual(platform_of("https://weibo.com/u/123"), "微博")
         self.assertEqual(platform_of("https://www.pinterest.com/pin/1"), "Pinterest")
 
+    def test_xxx_domain_not_x(self) -> None:
+        # `"x.com" in "de.hentai-cosplay-xxx.com"` 会命中，曾经把带 xxx 的资源站判成 X。
+        self.assertEqual(platform_of("https://de.hentai-cosplay-xxx.com/a"), "de.hentai-cosplay-xxx.com")
+        self.assertEqual(platform_of("https://xxx.com/a"), "xxx.com")
+
+    def test_x_subdomain_still_x(self) -> None:
+        self.assertEqual(platform_of("https://mobile.x.com/a/status/1"), "X (Twitter)")
+        self.assertEqual(platform_of("https://twitter.com/a/status/1"), "X (Twitter)")
+        self.assertEqual(platform_of("https://sotwe.com/a"), "X (Twitter)")
+
     def test_relevance_rank(self) -> None:
         self.assertEqual(relevance_rank("https://x.com/a"), 0)
         self.assertEqual(relevance_rank("https://pinterest.com/pin/1"), 2)
+
+    def test_forum_pages(self) -> None:
+        """论坛帖的标题不是人名：inven 那单把韩文帖子标题当名字发了出去。"""
+        self.assertTrue(extract.is_forum_page("https://www.inven.co.kr/board/lostark/6271/4036037"))
+        self.assertTrue(extract.is_forum_page("https://gall.dcinside.com/board/view/?id=1"))
+        self.assertFalse(extract.is_forum_page("https://x.com/NERUchi890/status/1"))
+        self.assertFalse(extract.is_forum_page("https://galleryepic.com/a"))
+        self.assertFalse(extract.is_forum_page(""))
+
+    def test_x_page_kind(self) -> None:
+        """只有 status/<id> 能当原帖，主页和转发/回复列表页都不行。"""
+        self.assertEqual(extract.x_page_kind("https://x.com/NERUchi890/status/2117586176714612824"), "post")
+        self.assertEqual(extract.x_page_kind("https://x.com/a/status/1/photo/1"), "post")
+        self.assertEqual(extract.x_page_kind("https://twitter.com/i/web/status/800792643705962496"), "post")
+        self.assertEqual(extract.x_page_kind("https://x.com/NENEchi8890"), "profile")
+        self.assertEqual(extract.x_page_kind("https://x.com/"), "profile")
+        self.assertEqual(extract.x_page_kind("https://x.com/AlbertGreen69/with_replies"), "with_replies")
+        self.assertEqual(extract.x_page_kind("https://x.com/a/reposts"), "reposts")
+        self.assertEqual(extract.x_page_kind("https://x.com/a/media"), "media")
+        self.assertEqual(extract.x_page_kind("https://x.com/search?q=abc"), "search")
+        self.assertEqual(extract.x_page_kind("https://sotwe.com/a"), "profile")
+        self.assertEqual(extract.x_page_kind("https://nudogram.com/models/x/1/"), "")
+
+    def test_only_post_pages_count_as_original(self) -> None:
+        self.assertTrue(extract.is_x_post_page("https://x.com/a/status/1"))
+        self.assertFalse(extract.is_x_post_page("https://x.com/a/with_replies"))
+        self.assertFalse(extract.is_x_post_page("https://x.com/a"))
 
 
 class KeyPoolTest(unittest.TestCase):
@@ -259,3 +313,50 @@ class SocialPlatformTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CrawlerPlaceholderTest(unittest.TestCase):
+    """Instagram / Facebook 的爬虫占位图：取回来是登录页 HTML，不是图。"""
+
+    def test_detects_lookaside_hosts(self) -> None:
+        self.assertTrue(
+            extract.is_crawler_placeholder(
+                "https://lookaside.instagram.com/seo/google_widget/crawler/?media_id=4008272337751746138"
+            )
+        )
+        self.assertTrue(
+            extract.is_crawler_placeholder(
+                "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=1060386696364398"
+            )
+        )
+
+    def test_normal_cdn_is_not_placeholder(self) -> None:
+        self.assertFalse(extract.is_crawler_placeholder("https://pbs.twimg.com/media/HWMtZrJbcAA82KO.jpg"))
+        self.assertFalse(extract.is_crawler_placeholder(""))
+
+    def test_rescue_instagram(self) -> None:
+        """短码能拼出免登录直链；实测 5/5 返回 JPEG。"""
+        self.assertEqual(
+            extract.rescue_image_url(
+                "https://www.instagram.com/reel/C2xmUF8LrMd/",
+                "https://lookaside.instagram.com/seo/google_widget/crawler/?media_id=1",
+            ),
+            "https://www.instagram.com/p/C2xmUF8LrMd/media/?size=l",
+        )
+
+    def test_rescue_gives_up_on_facebook(self) -> None:
+        self.assertEqual(
+            extract.rescue_image_url(
+                "https://www.facebook.com/61558497137816/videos/sunna-cosplay",
+                "https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=1",
+            ),
+            "",
+        )
+
+    def test_rescue_ignores_real_images(self) -> None:
+        self.assertEqual(
+            extract.rescue_image_url(
+                "https://www.instagram.com/p/DX18cbMCLqr/",
+                "https://scontent.cdninstagram.com/v/t51/abc.jpg",
+            ),
+            "",
+        )

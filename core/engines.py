@@ -18,11 +18,15 @@ from urllib.parse import urlparse
 from requests import ReadTimeout
 
 from .extract import (
+    X_PAGE_LABELS,
     clean_url,
     extract_identity,
+    is_crawler_placeholder,
     platform_of,
     promote_mirror,
     relevance_rank,
+    rescue_image_url,
+    x_page_kind,
 )
 from .httpclient import (
     HttpError,
@@ -646,6 +650,18 @@ def verify_candidate(
         candidate.status = "unverified"
         return candidate
 
+    # Instagram / Facebook 的候选图常是 Google 索引到的「爬虫占位」地址，取回来
+    # 是登录页 HTML。Instagram 能按短码换成真图直链，其余平台老实说取不到，
+    # 不要留一条含糊的「无法解码」让人以为是偶发失败。
+    if is_crawler_placeholder(candidate.image_url):
+        rescued = rescue_image_url(candidate.url, candidate.image_url)
+        if rescued:
+            candidate.image_url = rescued
+        else:
+            candidate.status = "unverified"
+            candidate.note = f"{candidate.platform or '该平台'}要登录才给图，取不到"
+            return candidate
+
     from .hashing import dhash, hamming
 
     try:
@@ -671,7 +687,14 @@ def verify_candidate(
 
     distance = hamming(target_hash, candidate_hash)
     candidate.distance = distance
-    if distance <= threshold:
+    # X 的主页、转发/点赞/回复列表页上出现的图，发布者是别人。指纹对上只能说明
+    # 「这张图在这一页里出现过」，不能说明是这个号的帖子，所以不能当原帖发出去。
+    page_kind = x_page_kind(candidate.url)
+    if distance <= threshold and page_kind and page_kind != "post":
+        label = X_PAGE_LABELS.get(page_kind, "页面")
+        candidate.status = "suspect"
+        candidate.note = f"指纹一致（距离 {distance}），但这是 X 的{label}，不是哪条帖子"
+    elif distance <= threshold:
         candidate.status = "match"
         candidate.note = f"指纹一致（距离 {distance}）"
     elif distance <= threshold + 6:

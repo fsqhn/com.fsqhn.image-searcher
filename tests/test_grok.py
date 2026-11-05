@@ -44,14 +44,23 @@ class BuildPayloadTest(unittest.TestCase):
         body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA")
         text = body["input"][0]["content"][0]["text"]
         self.assertIn("只找到账号不算完成", text)
-        self.assertIn("不要根据水印猜", text)
+        self.assertIn("不要凭水印或 ID 猜", text)
+
+    def test_prompt_reads_watermark_before_image_search(self) -> None:
+        """先读图上 ID，再走图搜图：水印印着账号的图，不先读等于白扔线索。"""
+        body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA")
+        text = body["input"][0]["content"][0]["text"]
+        self.assertIn("图上ID：", text)
+        first = text.index("第一步，找图上的 ID")
+        third = text.index("第三步")
+        self.assertLess(first, third)
 
     def test_prompt_requires_image_search_when_hints_miss(self) -> None:
         """候选都对不上时必须拿图去 x_search：自拍图只靠关键词必然搜不到。"""
         body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA", hints=["@someone | X | 标题"])
         text = body["input"][0]["content"][0]["text"]
         self.assertIn("这张图本身作为检索输入", text)
-        self.assertIn("算没完成任务", text)
+        self.assertIn("图上没有 ID、或者 ID 核实不到", text)
 
     def test_hints_are_passed_into_prompt(self) -> None:
         """已有候选要写进 prompt，让它先核对候选而不是凭空猜关键词。"""
@@ -63,6 +72,24 @@ class BuildPayloadTest(unittest.TestCase):
         text = body["input"][0]["content"][0]["text"]
         self.assertIn("@someone", text)
         self.assertIn("先", text)
+
+    def test_repost_note_warns_off_the_reposter(self) -> None:
+        """候选里是转发页时必须点明「图不是她发的」，否则模型会认下转发者。"""
+        body = grok.build_payload(
+            "grok-4.7",
+            "data:image/jpeg;base64,AAA",
+            repost_note="https://x.com/NENEchi8890/reposts",
+        )
+        text = body["input"][0]["content"][0]["text"]
+        self.assertIn("转发列表页", text)
+        self.assertIn("NENEchi8890", text)
+        self.assertIn("水印", text)
+
+    def test_no_repost_note_keeps_prompt_clean(self) -> None:
+        """没有转发页时不能出现这段提示，免得把普通候选也带偏。"""
+        body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA")
+        text = body["input"][0]["content"][0]["text"]
+        self.assertNotIn("转发列表页", text)
 
     def test_build_hints_dedupes_and_prefers_identity(self) -> None:
         class _Item:
@@ -93,6 +120,26 @@ class BuildPayloadTest(unittest.TestCase):
 
         self.assertEqual(len(grok.build_hints([_Item(i) for i in range(20)], limit=5)), 5)
 
+    def test_social_first_puts_reddit_before_art_sites(self) -> None:
+        """s-20261105-1433：画师站的插画把 Reddit 那条挤出了前 8 条，Grok 空手而归。"""
+
+        class _Item:
+            def __init__(self, name, platform, url):
+                self.handle = ""
+                self.name = name
+                self.platform = platform
+                self.url = url
+
+        items = [
+            _Item("Femboy Café", "furrynetwork.com", "https://furrynetwork.com/artwork/1875472"),
+            _Item("OC Princess", "furaffinity.net", "https://www.furaffinity.net/view/51574617"),
+            _Item("Join me ;3 : u/Smeepsi", "reddit.com", "https://www.reddit.com/user/Smeepsi/comments/1vicggz/join_me_3/"),
+        ]
+        ordered = grok.social_first(items)
+        self.assertEqual(ordered[0].platform, "reddit.com")
+        hints = grok.build_hints(ordered)
+        self.assertIn("u/Smeepsi", hints[0])
+
     def test_no_hints_keeps_original_prompt(self) -> None:
         body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA", hints=[])
         text = body["input"][0]["content"][0]["text"]
@@ -120,6 +167,47 @@ class ParseOutputTest(unittest.TestCase):
         self.assertEqual(result.tier, "post")
         self.assertEqual(result.handle, "abc_123")
         self.assertEqual(result.post_url, "https://x.com/abc_123/status/1234567890")
+
+    def test_watermark_field_recorded(self) -> None:
+        """图上读到的 ID 原样留着，作为线索记进日志。"""
+        body = _body(
+            "图上ID：@ste11ar021\n账号：@ste11ar021\n帖子：https://x.com/ste11ar021/status/2117169702099370423\n依据：水印就是它",
+        )
+        result = grok.parse_output(body)
+        self.assertEqual(result.watermark, "@ste11ar021")
+        self.assertEqual(result.tier, "post")
+
+    def test_watermark_none_is_empty(self) -> None:
+        for text in ("图上ID：无\n账号：@abc\n依据：图搜到", "图上ID：None\n依据：无"):
+            result = grok.parse_output(_body(text))
+            self.assertEqual(result.watermark, "", text)
+
+    def test_watermark_keeps_non_account_text(self) -> None:
+        """水印上可能是帖号或别的平台名字，不强行按 X 账号格式解析。"""
+        body = _body("图上ID：抖音号 7749 号贴\n依据：图搜到")
+        result = grok.parse_output(body)
+        self.assertIn("7749", result.watermark)
+
+    def test_post_field_none_ignores_annotation_links(self) -> None:
+        """正文写「帖子：无」时，annotations 里的搜索命中不能当成原帖。"""
+        body = _body(
+            "图上ID：KuukoW\n账号：@Kuukow002\n帖子：无\n依据：水印对应账号，以图搜过未见原帖",
+            urls=["https://x.com/i/status/1592552373729513472"],
+            tools=["x_user_search"],
+        )
+        result = grok.parse_output(body)
+        self.assertEqual(result.tier, "account")
+        self.assertEqual(result.handle, "Kuukow002")
+        self.assertEqual(result.post_url, "")
+
+    def test_internal_status_link_takes_handle_from_field(self) -> None:
+        """i/status 链接没有作者名时，用正文「账号：」补上。"""
+        body = _body(
+            "图上ID：KuukoW\n账号：@Kuukow002\n帖子：https://x.com/i/status/1592552373729513472\n依据：看到这条",
+        )
+        result = grok.parse_output(body)
+        self.assertEqual(result.tier, "post")
+        self.assertEqual(result.handle, "Kuukow002")
 
     def test_account_only(self) -> None:
         body = _body("账号：@ste11ar021\n帖子：无\n依据：水印和主页配图一致")
@@ -266,6 +354,27 @@ class FormattingTest(unittest.TestCase):
         outcome = SearchOutcome(status="not_found", grok={"tier": "none", "error": "Grok 70 秒内没返回"})
         text = formatting._best_block(outcome)
         self.assertIn("没做成", text)
+
+    def test_watermark_matching_conclusion_is_credited(self) -> None:
+        """图上印的号就是结论账号时，明说是顺着水印核出来的。"""
+        outcome = SearchOutcome(
+            status="ok",
+            grok={"tier": "post", "handle": "ste11ar021",
+                  "post_url": "https://x.com/ste11ar021/status/2117169702099370423",
+                  "watermark": "@ste11ar021"},
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("图上印的 ID 就是这个号", text)
+
+    def test_watermark_conflict_is_shown(self) -> None:
+        """读到的水印和结论不一致时要说出来，别让人以为是图搜的结果。"""
+        outcome = SearchOutcome(
+            status="ok",
+            grok={"tier": "account", "handle": "ste11ar021", "watermark": "@butter021"},
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("@butter021", text)
+        self.assertIn("与上面的结论不同", text)
 
     def test_without_grok_block(self) -> None:
         outcome = SearchOutcome(status="not_found", grok=None)

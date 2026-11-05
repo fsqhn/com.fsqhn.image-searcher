@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .engines import Candidate
+from .extract import is_forum_page
 from .tasks import SearchOutcome, SearchTask
 
 AI_FLAG_THRESHOLD = 0.75
@@ -36,7 +37,9 @@ def _identity_lines(candidate: Candidate) -> list[str]:
     if candidate.note:
         lines.append(f"🔍 匹配：{candidate.note}")
     if candidate.name:
-        lines.append(f"👤 名字：{candidate.name}")
+        # 论坛帖的「名字」其实是帖子标题，写清楚，免得当成作者名。
+        label = "📄 标题" if is_forum_page(candidate.url) else "👤 名字"
+        lines.append(f"{label}：{candidate.name}")
     if candidate.handle:
         lines.append(f"🆔 账号：{candidate.handle}")
     if candidate.url:
@@ -44,14 +47,34 @@ def _identity_lines(candidate: Candidate) -> list[str]:
     return lines
 
 
+def _watermark_line(grok: dict) -> str:
+    """图上 ID 与结论账号的关系。
+
+    实测读水印会把 ``@ste11ar021`` 认成 ``@butter021``，所以读到的 ID 不能
+    静默丢掉：跟结论一致就说明这一单是顺着水印核出来的，不一致就明写出来，
+    免得用户以为是图搜的结果。
+    """
+    raw = str(grok.get("watermark") or "").strip()
+    if not raw:
+        return ""
+    handle = str(grok.get("handle") or "").strip().lstrip("@").lower()
+    seen = raw.lstrip("@").strip().lower()
+    if handle and handle in seen:
+        return f"🏷 图上印的 ID 就是这个号（{raw}），已按它核对。"
+    return f"🏷 图上读到 ID：{raw}（与上面的结论不同，已按核实结果为准）。"
+
+
 def _grok_lines(grok: dict) -> list[str]:
     """Grok 兜底的两档文案：post 是找到，account 只是线索。"""
     tier = grok.get("tier")
     reason = str(grok.get("reason") or "").strip()
+    mark = _watermark_line(grok)
     if tier == "post":
         lines = ["✅ 找到 X 上的原帖"]
         if grok.get("post_url"):
             lines.append(f"🔗 {grok['post_url']}")
+        if mark:
+            lines.append(mark)
         if reason:
             lines.append(f"🔍 依据：{reason}")
         return lines
@@ -63,13 +86,123 @@ def _grok_lines(grok: dict) -> list[str]:
             # 帖子配图指纹对不上：账号多半是对的，帖子可能是同一套的另一张。
             # 只给链接，不说成原帖——同景同角色换个人拍，指纹也会这样。
             lines.append(f"🔗 存疑参考（配图相似但非同图，可能是同一套的另一张，请自行核对）：{grok['post_url']}")
+        if mark:
+            lines.append(mark)
         if reason:
             lines.append(f"🔍 依据：{reason}")
         return lines
     return []
 
 
+def _fans_text(count: int) -> str:
+    if count >= 10000:
+        return f"{count / 10000:.1f} 万"
+    return str(count)
+
+
+def _x_guess_lines(outcome: SearchOutcome) -> list[str]:
+    """疑似 X 账号：必须写清「从哪条候选推出来的」，不然会被当成原帖。"""
+    guess = outcome.x_guess or {}
+    handle = str(guess.get("handle") or "").strip()
+    if not handle:
+        return []
+    # Grok 已经核到同一个号，就不用再说一遍名字推断的过程。
+    if str((outcome.grok or {}).get("handle") or "").strip().lower() == handle.lower():
+        return []
+    fans = int(guess.get("followers") or 0)
+    platform = str(guess.get("source_platform") or "").strip() or "候选"
+    title = str(guess.get("source_title") or "").strip()
+    lines = [f"🐦 疑似同一个人的 X：@{handle} https://x.com/{handle}（粉丝 {_fans_text(fans)}）"]
+    if title:
+        lines.append(f"从候选 {platform} 的标题「{title}」里认出这个名字，X 上确认账号存在。")
+    else:
+        lines.append(f"从候选 {platform} 的标题里认出这个名字，X 上确认账号存在。")
+    lines.append("只是同一个人可能用的号，不是这张图的原帖。")
+    return lines
+
+
+def _paid_lines(outcome: SearchOutcome) -> list[str]:
+    """付费内容线索：写清是「这个人做 OnlyFans」而不是「这张图的原帖」。"""
+    paid = outcome.paid or {}
+    handle = str(paid.get("handle") or "").strip()
+    if not handle:
+        return []
+    name = str(paid.get("name") or "").strip() or handle
+    links = [f"https://onlyfans.com/{handle}"]
+    x_handle = str(paid.get("x_handle") or "").strip()
+    if x_handle:
+        fans = int(paid.get("x_followers") or 0)
+        tail = f"（粉丝 {_fans_text(fans)}）" if fans else ""
+        links.append(f"https://x.com/{x_handle}{tail}")
+    instagram = str(paid.get("instagram") or "").strip()
+    if instagram:
+        links.append(instagram)
+    lines = [f"💳 疑似同一个人的 OnlyFans：{name}"]
+    lines.append("主页 " + "，".join(links))
+    platform = str(paid.get("source_platform") or "").strip() or "候选"
+    title = str(paid.get("source_title") or "").strip()
+    page_url = str(paid.get("page_url") or "").strip()
+    if title:
+        head = f"从候选 {platform} 的标题「{title}」里认出这个名字"
+    else:
+        head = f"从候选 {platform} 的标题里认出这个名字"
+    lines.append(f"{head}，泄露站收录过该名字的付费内容{'：' + page_url if page_url else '。'}")
+    lines.append("只是同一个人可能在卖的号，不是这张图的原帖。")
+    return lines
+
+
+def _same_person_lines(outcome: SearchOutcome) -> list[str]:
+    """几个 X 号挂着同一条外链：写明依据，别让人以为是猜出来的。"""
+    info = outcome.same_person or {}
+    members = [item for item in (info.get("members") or []) if isinstance(item, dict)]
+    link = str(info.get("link") or "").strip()
+    if len(members) < 2:
+        return []
+    parts: list[str] = []
+    for item in members:
+        tag = _fans_text(int(item.get("followers") or 0)) if item.get("followers") else ""
+        if item.get("tied"):
+            tag = f"{tag}，跟这张图对上的那条" if tag else "跟这张图对上的那条"
+        parts.append(f"@{item.get('handle')}（{tag}）" if tag else f"@{item.get('handle')}")
+    who = "、".join(parts)
+    lines = [f"👥 这{len(members)}个号是同一个人：{who}"]
+    if link:
+        lines.append(f"依据：几个号的资料里挂着同一条 {link}，不是猜名字。")
+    else:
+        lines.append("依据：几个号挂着同一条外链，不是猜名字。")
+    lines.append("这条只说明这几个号是同一个人，不表示他们就是这张图的作者。")
+    return lines
+
+
+def _vision_reason(vision: dict | None) -> str:
+    """把视觉模型给的理由原样亮出来。
+
+    它常按「黑蕾丝、白短袜、室内」这类服装与场景判成同一个人，理由里甚至会把
+    发色写错。不写出来，用户只看「疑似同一个人」无从判断；写出来一眼就知道这
+    是照服装猜的，不是认脸。
+    """
+    reason = str((vision or {}).get("reason") or "").strip()
+    if not reason:
+        return ""
+    return f"🧠 它给的理由：{reason[:80]}"
+
+
 def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
+    text = _best_block_core(outcome, skip_grok=skip_grok)
+    extra: list[str] = []
+    if not skip_grok:
+        miss = _grok_miss_line(outcome)
+        if miss:
+            extra.append(miss)
+    extra.extend(_same_person_lines(outcome))
+    extra.extend(_x_guess_lines(outcome))
+    extra.extend(_paid_lines(outcome))
+    if extra:
+        text = "\n".join([text, *extra])
+    return text
+
+
+def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     best = outcome.best
     grok = outcome.grok or {}
     grok_lines = _grok_lines(grok)
@@ -84,8 +217,11 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
                 grok_lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，但都没有可核对的账号（电商商品页或只有平台页面），只当参考。"
+                    f"视觉复核挑出 {vision['downgraded']} 条，但落点是电商商品页或音乐站、图库站这类页面，不是作者主页，只当参考。"
                 )
+                reason_line = _vision_reason(vision)
+                if reason_line:
+                    grok_lines.append(reason_line)
             else:
                 grok_lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
         elif vision.get("error"):
@@ -104,8 +240,11 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
                 lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，但都没有可核对的账号（电商商品页或只有平台页面），只当参考。"
+                    f"视觉复核挑出 {vision['downgraded']} 条，但落点是电商商品页或音乐站、图库站这类页面，不是作者主页，只当参考。"
                 )
+                reason_line = _vision_reason(vision)
+                if reason_line:
+                    lines.append(reason_line)
             else:
                 lines.append(f"视觉复核了 {vision['checked']} 张候选，没有发现同一个人。")
         elif vision.get("error"):
@@ -118,7 +257,17 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
             else:
                 lines.append("Grok 在 X 上搜过，没有找到对应的账号或帖子。")
         if suspects:
-            lines.append(f"另有 {len(suspects)} 条疑似同图，仅供参考，见参考区。")
+            # 「疑似同图」会把 20 多距离的照骗说成同一张：实际多是同角色、同款服装
+            # 的另一个人，写清楚免得以为快找到了。
+            low = min((item.distance for item in suspects if item.distance is not None), default=None)
+            high = max((item.distance for item in suspects if item.distance is not None), default=None)
+            gap = f"（指纹距离 {low}～{high}）" if low is not None and high is not None and low != high else ""
+            if gap:
+                lines.append(
+                    f"另有 {len(suspects)} 条是同角色或同款服装的图{gap}，不是这张照片本身，见参考区。"
+                )
+            else:
+                lines.append(f"另有 {len(suspects)} 条是同角色或同款服装的图，不是这张照片本身，见参考区。")
         if outcome.total_candidates:
             lines.append(f"共收到 {outcome.total_candidates} 条结果，见参考区。")
         return "\n".join(lines)
@@ -126,6 +275,9 @@ def _best_block(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
     if best.status == "vision":
         # 视觉判的是「同一个人」，不是同一张图，别让用户以为这就是那张原图。
         lines.insert(0, "🧠 没找到同一张图，但视觉复核认为是同一个人")
+        reason_line = _vision_reason(outcome.vision)
+        if reason_line:
+            lines.append(reason_line)
         lines.append("⚠️ 这条是视觉模型挑的，不是指纹比对，可能认错，请自行核对。")
     if grok_lines:
         lines.append("—")
@@ -382,6 +534,17 @@ def _node(content: list[dict], nickname: str, user_id: str) -> dict:
     return item
 
 
+def _grok_miss_line(outcome: SearchOutcome) -> str:
+    """Grok 跑了但没找到时给一句交代。
+
+    没有这句时，「没触发」和「触发了没结果」在群里看起来一模一样。
+    """
+    grok = outcome.grok or {}
+    if grok.get("tier") != "none" or not grok.get("ok"):
+        return ""
+    return "🔎 Grok 也拿这张图去 X 搜过，没撞见原帖。"
+
+
 def _vision_block(outcome: SearchOutcome) -> list[dict] | None:
     """视觉复核命中时单独一块：结论 + 它挑中的那张图。"""
     best = outcome.best
@@ -389,6 +552,10 @@ def _vision_block(outcome: SearchOutcome) -> list[dict] | None:
         return None
     lines = ["🧠 没找到同一张图，但视觉复核认为是同一个人", *_identity_lines(best)]
     lines.append("⚠️ 这条是视觉模型挑的，不是指纹比对，可能认错，请自行核对。")
+    miss = _grok_miss_line(outcome)
+    if miss:
+        lines.append(miss)
+    lines.extend(_same_person_lines(outcome))
     content: list[dict] = [{"type": "text", "content": "\n".join(lines)}]
     if outcome.image_b64:
         content.append({"type": "image", "content": outcome.image_b64})
@@ -498,6 +665,20 @@ def _tail_nodes(
     return nodes
 
 
+def count_forward_images(nodes: list[dict]) -> int:
+    """数一条合并转发里有几张图。
+
+    NapCat 单条转发实测 6 张能过、13 张失败，发送层按这个数决定是合并成
+    一条还是拆开发。
+    """
+    return sum(
+        1
+        for item in nodes
+        for part in item.get("content") or []
+        if isinstance(part, dict) and part.get("type") == "image"
+    )
+
+
 def build_result_forwards(
     task: SearchTask,
     *,
@@ -509,10 +690,11 @@ def build_result_forwards(
     replay: bool = False,
     user_id: str = "",
 ) -> list[list[dict]]:
-    """把结果拆成几条转发：视觉一条、Grok 一条、页脚一条。
+    """把结果拆成几条消息：视觉一条、Grok 一条、页脚一条。
 
     视觉的结果和图、Grok 的结果和图各占一条，页脚（任务编号、更多、重搜）
-    单独一条。两边都没内容时返回原来的单条结构，避免无谓地多发消息。
+    单独一条。发送层把这几条放进同一个合并转发节点列表，用户在群里看到的
+    是一条转发，点开是三条。两边都没内容时返回原来的单条结构。
     """
     outcome = task.outcome or SearchOutcome(status="error")
 

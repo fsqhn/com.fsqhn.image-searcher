@@ -18,9 +18,12 @@ core/engines.py        Lens / Yandex / 百度 / SauceNAO 适配 + detect_ai + ve
 core/hashing.py        dHash 指纹 + prepare_upload（压到 480KB）
 core/formatting.py     合并转发节点、路线行、重放文案
 core/extract.py        平台识别、账号页判定与归一、账号去重
+core/handles.py        从候选标题里认疑似 X 账号名（纯函数，不碰网络）
 core/resultcache.py    按图缓存（纯函数 + 原子落盘）
-core/vision.py         视觉复核：拼对照图、写 prompt、解析回复（纯函数，不碰网络）
-core/grok.py           Grok 兜底：写 prompt、拼请求体、解析帖子/账号链接（纯函数，不碰网络）
+core/vision.py         视觉复核：拼对照图、写 prompt、解析回复、命中档位（纯函数，不碰网络）
+core/grok.py           Grok 兜底：写 prompt、候选排序、拼请求体、解析帖子/账号链接（纯函数，不碰网络）
+core/paid.py           OnlyFans 线索：泄露站收录页解析、名字与 slug 校验（纯函数，不碰网络）
+core/same_person.py    同外链归人：分组、锚点准入（纯函数，不碰网络）
 core/fxtwitter.py      推文 ID 解析、fxtwitter 返回解析、核对判定 hit/miss/unknown（纯函数，不碰网络）
 core/tasks.py          SearchOutcome（含 route / cached）、TaskStore（TTL / 上限 / 落盘恢复）
 core/commands.py       指令正则 + split_force（「重搜」解析）
@@ -34,17 +37,31 @@ core/maibot_compat.py  能力返回值解包
 
 **指纹是主路，视觉只兜底**：判断「是不是同一张图」仍然只看 dHash。只有整轮一个 `match` 都没有、`[vision] enabled` 开着、且不是插画路线时，才把目标图和最接近的候选拼成一张编号网格交给 `vlm` 任务，问的是「有没有同一个人」。命中项标 `status="vision"`，文案必须写「视觉复核」。拼图、prompt、解析在 `core/vision.py`（纯函数，有单测）。
 
+**指纹命中常落在搬运站，作者账号要另外找**：`_pick_best()` 里 X 优先的窗口是「距离 ≤ 最优值 + 1」——搬运站存原图，X 那条被压过以后距离通常高 1~2，只允许同距离就等于永远轮不到作者本人；差得更多则不算同一张图，不能为了平台把它顶上来。另外 `_hunt_x_handle()` 会从候选标题里抽像用户名的词（`core/handles.py`），逐个用 `api.fxtwitter.com/2/profile/<handle>` 验证，取粉丝 ≥ 500 且名字主干真的在标题里出现过的那个，写进 `outcome.x_guess`。它**不改 best、不覆盖 Grok 已经核到的号**，结果里必须写明「从哪条候选的标题推出来的、不是这张图的原帖」——名字推断不等于原帖，这条别省。
+
 提示词不能要求必须露脸——很多目标是只有腿、背影或局部裁切的图。门槛是「个体化证据」：脸、纹身、痣、手型、饰品、图案位置这类属于具体某个人的细节；只能说出角色名、同款服装、发色、体型、姿势的，一律返回空数组。拼图 4 列 × 320，格子小到只能认角色就是这套机制失效的根因。
 
 **视觉超时要按「排队 + 推理」算**：`[vision] timeout` 默认 180 秒，不是 90。宿主的 LLM 并发会被记忆整理（`A_Memorix.*`）这类任务占满，一次视觉请求实测排了 78 秒才轮到选模型，90 秒会在模型刚被选中时放弃。失败路径必须打 warning（已记等待时长与模型名），否则只剩任务摘要里一行 error，查不出是排队还是模型慢。
 
-**Grok 兜底与视觉并行，分两档**：同一个触发条件、`[grok] enabled` 开着且有 `api_key` 时，两边一起发出去（`asyncio.gather`），各自超时。发给它的是原图 + 前 8 条候选（`账号｜平台｜标题`），让它先核对候选里谁是发布者，都对不上才自己另搜（`core/grok.py` 的 `build_hints()`，日志里有 `候选=`）。判据只看返回链接：带 `status/<id>` 算「找到」，只有账号主页算「线索」。只给账号时会用 `cdn.syndication.twimg.com` 确认账号真实存在，确认不了整条丢掉。
+**Grok 兜底与视觉并行，分两档**：同一个触发条件、`[grok] enabled` 开着且有 `api_key` 时，两边一起发出去（`asyncio.gather`），各自超时。发给它的是原图 + 前 8 条候选（`账号｜平台｜标题`），`build_prompt()` 让它按三步走：先读图上的水印/签名/边角小字里有没有 ID，有就按这个 ID 去 X 核实发布者，核实不到或者本来没 ID 才走图搜图、逐个比对候选（`core/grok.py` 的 `build_hints()`，日志里有 `候选=`）。判据只看返回链接：带 `status/<id>` 算「找到」，只有账号主页算「线索」。只给账号时会用 `cdn.syndication.twimg.com` 确认账号真实存在，确认不了整条丢掉。**候选要按社交平台优先喂**（`grok.social_first()`）：Reddit、Instagram、抖音这类页面上的用户名才是通向作者本人的线索，按原顺序排时前 8 条常被画师站插画占满，Grok 根本看不到 `u/Smeepsi` 这个名字。**超时或连接错误要重试一次**（隔 2 秒、用更短的超时），中转站实测会卡满 120 秒；服务端明确回 4xx/5xx 的不重试。错误文案统一成「中转站 N 秒内没响应」，别把 requests 的堆栈直接发给群友。它跑过但空手时，结果里要有一句「Grok 也拿这张图去 X 搜过，没撞见原帖」，否则「没触发」和「触发了没结果」看起来一模一样。
 
-**视觉命中还要过闸门**：判定集中在 `core/vision.py` 的 `verdict_of()`，检查顺序有意义，别调换——先 `VERDICT_COMMERCE`（候选落在速卖通 / 阿里 / 淘宝 / 1688 / Amazon / eBay 这类电商站，只是同款衣服），再 `VERDICT_UNTRACEABLE`（整条不可追踪：不是社交平台、也没有账号），最后 `VERDICT_NO_ACCOUNT`（落在抖音、小红书这类平台页面上，却解析不出发布者，点进去也确认不了是谁发的）。只有 `VERDICT_VISION` 能当结论，后三档一律降级成 `suspect` 只进参考区，日志记 `降级=N`，说明文案在 `DOWNGRADE_NOTES`。视觉命中发出去时，结论必须带免责声明，文案在 `core/formatting.py` 的 `_best_block()`。
+**视觉命中还要过闸门**：判定集中在 `core/vision.py` 的 `verdict_of()`，检查顺序有意义，别调换——先 `VERDICT_COMMERCE`（候选落在速卖通 / 阿里 / 淘宝 / 1688 / Amazon / eBay 这类电商站，只是同款衣服），再 `VERDICT_REPOST`（`reposts` / `likes` / `with_replies` 这类列表页，图是别人发的），再 `VERDICT_UNTRACEABLE`（整条不可追踪：不是社交平台、也没有账号），最后 `VERDICT_NO_ACCOUNT`（落在抖音、小红书这类平台页面上，却解析不出发布者，点进去也确认不了是谁发的）。只有 `VERDICT_VISION` 能当结论，后三档一律降级成 `suspect` 只进参考区，日志记 `降级=N`，说明文案在 `DOWNGRADE_NOTES`。视觉命中发出去时，结论必须带免责声明，文案在 `core/formatting.py` 的 `_best_block()`。降级文案要**点名是哪个站**（`DOWNGRADE_NOTES` 里的 `{platform}`）：「那是 soundcloud.com 上的页面、不是作者主页」比「找不到可核对的账号」有用得多。结论里还要把模型给的理由原样列一句（`_vision_reason()`，截 80 字）——它常按「黑蕾丝、白短袜、室内」判成同一个人，理由里甚至会把发色写错，亮出来用户一眼就能看出这轮靠不靠谱。
+
+**X 上只有 ``/<号>/status/<id>`` 能当结论**：转发页（`reposts` / `likes` / `with_replies`）、账号主页、引用帖都不行。
+
+- 页面类型统一走 `core/extract.py::x_page_kind()`，别在各处自己写正则。非帖子页即使指纹达标也只给 `suspect`，备注写清「这是 X 的回复列表页／账号主页」。`_pick_best()` 的「X 优先」同样只对帖子页生效。
+- **引用帖要换成原帖**：fxtwitter 的 `quote` 字段直接给出被引用那条的地址与作者。帖子自己没配图（`media` 为空）且有 quote 时，图只能来自被引用那条，`_follow_quote()` 会把结论换成原帖并注明「原文是 @xxx 的引用帖」。实测 YuMIkAnime 引用了 @qyuuuz 的图吐槽，被当成作者发了出去；那种「自己配了图」的引用帖不要动。
+- **视觉落在账号主页时先翻帖再定档**：`_settle_vision_handle()` 用 `_media_lookup()` 翻这个号自己的带图帖（`/media` 不含转发）逐张比指纹，命中就换成那条帖子；一条都没中就降成 `suspect` 并把计数补进 `vision["downgraded"]`。实测 s-20261105-1537 挑中 `x.com/realpakbupati`（69 粉的印尼号），理由是「同款发饰、发尾蓝白渐变」，可那张图是粉发白裙、跟原图的银紫发护士服毫无关系——主页上什么图都有，撑不起「这张是她发的」。
+
+**名字推断与付费线索必须先有锚点**：`_identity_texts()` 返回空（一条 `match` / `vision` 都没有）时，`_hunt_x_handle()` 与 `_hunt_paid()` 直接 `return None`。这时标题里的「名字」只是噪声词，实测抽中过 106 万粉的 `@nothing`（来自画师站标题「Nothing To Hide」）和 `@Design`。同理 `same_person.find_shared(anchors=)` 的分组必须含锚点，注释里要写明「只说明这几个号是同一个人，不表示他们就是这张图的作者」。
+
+**抽名字用的文本要剥掉帖子正文**：X 帖标题形如「名字 on X: "正文"」，整条拿去抽会把正文里的词当人名——`kiko on X: "Happy Halloween!"` 就抽出了 Halloween，一路推出 @halloween（1.44 万粉）和 `leakgallery.com/Halloween`。`Candidate.finalize` 里的名字、`plugin._name_text()` 喂给 `handles.extract()` 的文本，都只保留 `on X:` 前面那截（`core/extract.py::x_title_name()`）。
+
+**论坛与社区站的标题不是名字**：inven、DCInside、arca.live、bcy、贴吧、5ch、PTT、Reddit、namu.wiki 这些站的「标题」是帖子标题，结果里写 `📄 标题：`，不写 `👤 名字：`。判断在 `core/extract.py::is_forum_page()`。
 
 **命中时首次回复只给结论**：只要 `status == "ok"`（指纹、视觉、Grok 任一命中），`build_forward_nodes` 与 `build_text_summary` 都不列参考区；没找到时才把参考区发出来。改配图或转发结构时注意这条，别让命中场景又刷回四五条。
 
-**视觉、Grok、页脚各占一条转发**：首次回复走 `build_result_forwards()`，最多返回三块——视觉的判断加它挑中的图、Grok 的账号/帖子加帖子配图、页脚（路由、任务编号、更多、重搜）。两边都没内容时自动退回单条 `build_forward_nodes`，指纹命中场景不受影响。「更多」仍然走单条，别把候选列表也拆散。
+**视觉、Grok、页脚共用一条合并转发里的三个节点**：首次回复走 `build_result_forwards()`，最多返回三块——视觉的判断加它挑中的图、Grok 的账号/帖子加帖子配图、页脚（路由、任务编号、更多、重搜）。发送层展平成一次 `ctx.send.forward()`，群里只出一条消息、点开是三条。图数超过 `_MAX_FORWARD_IMAGES`（6 张）时才退回逐块发送，否则 NapCat 会拒收整条。两边都没内容时自动退回单条 `build_forward_nodes`，指纹命中场景不受影响。「更多」仍然走单条，别把候选列表也拆散。
 
 **「更多」靠任务编号定位**：首次回复的页脚必须带 `task_id`，用户回「更多 <task_id>」重发那一次；不带编号退回本会话最近一次。结果默认保留 1 天（`task_ttl_minutes`），过期后带编号再问要明确回「缓存已清，重新搜」，不能装作没看见。页脚在「更多」那行之后还要给一条「重搜」示例（发图时带上「指令 重搜」），缓存秒回时用户才知道怎么强制重跑。`TaskStore._evict` 的 80 条上限也是为这个 TTL 服务的。
 
@@ -69,6 +86,8 @@ core/maibot_compat.py  能力返回值解包
 **`unknown` 要重核一次**：配图偶发下载失败会让距离变成 -1，同一个帖子第一次 `unknown`、重跑一次就是 `hit`（实测过）。批量核对时漏掉一条就全废，所以 `_verify_tweet()` 里 `unknown` 且没有明确错误时再跑一次。
 
 **参考图按指纹距离挑，并把距离写进文案**：核对全 miss 或整单没找到时，参考图取「候选里跟原图最接近的一张」（`_best_image()`，按距离而非引擎顺序），Grok 有 `reference_url` 时优先用它。图注必须带上距离（`_reference_distance()`，如「指纹距离 24，不是同一张」）——不写距离，用户会把一张毫不相干的配图当成结果。用户明确要求保留图：「有个图至少有个谱，没图连谱都没了」，所以别改成只给链接。
+
+**没找到时别把「疑似」说成「快找到了」**：`not_found` 的参考区上方要写明「另有 N 条是同角色或同款服装的图（指纹距离 a～b），不是这张照片本身」，距离取 suspect 里的 min～max，相等时不写区间。写成「疑似同图」会让 20 多距离的照骗看起来像是差一点就命中。
 
 **`x.com/i/status/<id>` 是有用的链接**：这种 X 内部跳转链接没有作者名，但 status id 是真的，fxtwitter 能顺着它解析出真实作者。`find_posts()` 只对这一种保留（handle 记空），别的保留路径（`home`、`search` 等）照样丢。核对成功后要把解析出来的账号回填到 `info["handle"]`，否则 `miss` 分支会因为「没账号」把帖子整个扔掉。
 
@@ -132,7 +151,7 @@ core/maibot_compat.py  能力返回值解包
 12. **展示按引擎分组，配图分两档**：首次回复每个引擎只贴最接近那张，回「更多」时每个候选都贴图，图压到 60KB 左右。`outcome.images` 只在内存、不落盘。
 13. **vlm 组里的模型都能读图，但推理型的会截断正文**：`dots3-note-prev` 把 600 输出额度全花在 reasoning 上、`content` 为空。所以 `[vision] model` 默认留空、按任务组顺序挑；真想点名就填 `Qwen/Qwen3-VL-32B-Instruct`。测多模态一定要用真实尺寸的图。
 14. **视觉调用要传 `task_name`**：`model` 传任务名会被当成具体模型名。正确写法 `ctx.call_capability("llm.generate", prompt=..., task_name="vlm", ...)`，图片走 Data URL。
-15. **Grok 读水印会读错，别拿它当 OCR**：判定只认返回链接，账号存在性靠 `_account_exists()` 兜。
+15. **Grok 读水印会读错，读到的只能当线索**：实测把 `@ste11ar021` 认成 `@butter021`，所以它读出来的 ID 用 `watermark_of()` 单独存着，只进日志（`Grok 图上读到 ID：…`）和结果标注（`_watermark_line()`：一致时说「图上印的 ID 就是这个号」，不一致时说「与上面的结论不同，已按核实结果为准」），绝不参与判定。判定只认返回链接，账号存在性靠 `_account_exists()` 兜。
 16. **Grok 只能走 `/v1/responses` + `tools:[{"type":"x_search"}]`**：`chat/completions` 带 `search_parameters` 会被打回 410；图片只认 data URL。一次完整检索约 48 秒，服务端抖动时超时不能省。
 17. **拼图要逐张解码**：`vision.build_grid` 是解码→缩放→贴画布→丢引用，`MAX_SOURCE_PIXELS` 是兜底，别去掉。
 18. **缓存别存「没找到」**：实测同一张图 12 小时后就能搜到，存下来反而挡住后来的原帖。
@@ -143,6 +162,12 @@ core/maibot_compat.py  能力返回值解包
 23. **视觉提示词拦不住「认衣服」**：门槛改成「个体化证据」后，模型照样把「刺绣细节」「袜口褶皱」当证据，理由是换了词、判断没变。真正起效的是分辨率：同一批 13 张候选，5 列 × 224 挑 6 条，4 列 × 320 只挑 1 条。所以别改回 5 列 / 224；也**别用减少候选数换分辨率**——候选是按距离截断的，砍掉后半段就是把真命中扔了。
 24. **QQ 转发压缩不改变指纹**：同一张原图压到 JPEG q55、缩到 720 宽、转 WebP q70，距离全是 0；加 20px 白边是 5、裁 5% 是 4。所以看到距离 13、24 就是「真不是同一张」，别拿压缩当借口放宽 `hash_threshold`。
 25. **别给「同角色 / 同款服装 / 同发色」当证据**：实测这几种理由撑起了绝大多数视觉误判。视觉只做兜底，`hash_threshold` 也不因为它远就放宽——dHash 距离和「是不是同一个人」没有对应关系，按距离阈值切档是伪精度。
+26. **合并转发不会因为条数被限流**：3 条消息就是 3 次 `send_group_forward_msg`，离群消息频控线差得远，日志里也从没出现过「合并转发失败 / 限流 / rate limit」。三条现在塞进同一次调用的三个节点，群里只出一条。真正会失败的是单条图数超 6 张被 NapCat 拒收，以及宿主 `cap.call` 的 30 秒超时（19:22:50 那次合并转发就超时过）。别再凭感觉加 sleep 或拆条。
+27. **正文「帖子：」字段优先于 annotations**：annotations 会把模型检索时撞见的页面全标上，不是它给出的结论。实测一单它正文写「帖子：无、账号：@Kuukow002」，annotations 里却挂着一条 2022 年的无关帖子，旧解析因此判成 post 档、还把账号丢了。现在 `field_posts()` 先看这一行：写了「无」就不再拿 annotations 顶替；`i/status` 没有作者名时用正文「账号：」补。
+28. **引用帖不是原帖**：`x.com/YuMIkAnime/status/...` 那条正文在吐槽「有人盗图」，图是引用 @qyuuuz 的，结果被当成 YuMIkAnime 发的。fxtwitter 的 `quote` 字段带着原帖地址与作者，纯引用（自身 `media` 为空）时一定要回退，别只在 `reposts` / `likes` 这类列表页上做文章。
+29. **账号主页撑不起结论**：视觉挑中 `x.com/realpakbupati`（69 粉，名字是印尼语「县长先生」），理由写「同款发饰、发尾蓝白渐变」，可那张图是粉发白裙。主页上什么图都有，必须先翻 `/media` 比指纹，翻不到就降级。
+30. **X 帖正文里的词会被当成人名**：`kiko on X: "Happy Halloween!"` 抽出了 Halloween，推出 @halloween（1.44 万粉）和泄露站页面。`on X:` 后面是正文，抽名字前必须剥掉。
+31. **视觉的理由可能取自别的格子**：同一单里它说「发尾蓝白渐变」，挑中的却是粉发那张——拼图里不同格的特征被串了。所以理由要原样发给用户（`_vision_reason()`），它自己就是最好的可信度提示。
 
 ## 排障顺序
 
@@ -168,7 +193,7 @@ core/maibot_compat.py  能力返回值解包
 python -m unittest discover -s tests -v
 ```
 
-目前 227 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 323 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

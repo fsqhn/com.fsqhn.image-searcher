@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from .extract import is_social_platform
+from .extract import is_repost_page, is_social_platform
 
 GRID_COLS = 4
 CELL_SIZE = 320
@@ -146,13 +146,15 @@ def is_traceable(handle: str = "", platform: str = "", url: str = "") -> bool:
 # 再看能不能追踪，最后确认有没有账号名。
 VERDICT_VISION = "vision"
 VERDICT_COMMERCE = "commerce"
+VERDICT_REPOST = "repost"
 VERDICT_UNTRACEABLE = "untraceable"
 VERDICT_NO_ACCOUNT = "no_account"
 
 DOWNGRADE_NOTES = {
     VERDICT_COMMERCE: "视觉复核：疑似同一个人，但来自电商商品页（{gap}），仅供参考",
-    VERDICT_UNTRACEABLE: "视觉复核：疑似同一个人，但找不到可核对的账号（{gap}），仅供参考",
-    VERDICT_NO_ACCOUNT: "视觉复核：疑似同一个人，但只找到平台页面、没有账号可核对（{gap}），仅供参考",
+    VERDICT_REPOST: "视觉复核：疑似同一个人，但那是转发页、图不是她发的（{gap}），仅供参考",
+    VERDICT_UNTRACEABLE: "视觉复核：疑似同一个人，但那是{platform}上的页面、不是作者主页（{gap}），仅供参考",
+    VERDICT_NO_ACCOUNT: "视觉复核：疑似同一个人，但只找到{platform}的平台页面、解析不出发布者（{gap}），仅供参考",
 }
 
 
@@ -165,6 +167,8 @@ def verdict_of(handle: str = "", platform: str = "", url: str = "", name: str = 
     """
     if is_commerce(platform, url, name):
         return VERDICT_COMMERCE
+    if is_repost_page(url):
+        return VERDICT_REPOST
     if not is_traceable(handle, platform, url):
         return VERDICT_UNTRACEABLE
     if not str(handle or "").strip():

@@ -34,6 +34,13 @@ class Tweet:
     media: list[str] = field(default_factory=list)
     protected: bool = False
     created_at: str = ""
+    # 引用帖（quote）指向的那条原帖。引用帖自己没有配图时，图上一定来自原帖，
+    # 结论要换成原帖作者——之前 YuMIkAnime 引用 @qyuuuz 的图吐槽，被当成了作者。
+    quote_url: str = ""
+    quote_id: str = ""
+    quote_handle: str = ""
+    quote_name: str = ""
+    quote_text: str = ""
 
 
 def parse_tweet_id(text: str) -> str:
@@ -88,6 +95,9 @@ def parse_tweet(payload: dict | None, *, tweet_id: str = "") -> Tweet:
         if url and url not in urls:
             urls.append(url)
 
+    quote = data.get("quote") if isinstance(data.get("quote"), dict) else {}
+    quote_author = quote.get("author") if isinstance(quote.get("author"), dict) else {}
+
     return Tweet(
         ok=True,
         tweet_id=str(data.get("id") or tweet_id),
@@ -98,6 +108,11 @@ def parse_tweet(payload: dict | None, *, tweet_id: str = "") -> Tweet:
         media=urls,
         protected=bool(author.get("protected")),
         created_at=str(data.get("created_at") or ""),
+        quote_url=str(quote.get("url") or ""),
+        quote_id=str(quote.get("id") or ""),
+        quote_handle=str(quote_author.get("screen_name") or "").strip(),
+        quote_name=str(quote_author.get("name") or "").strip(),
+        quote_text=str(quote.get("text") or ""),
     )
 
 
@@ -111,3 +126,64 @@ def judge(distances: list[int], threshold: int) -> str:
     if not usable:
         return "unknown"
     return "hit" if min(usable) <= max(0, threshold) else "miss"
+
+
+@dataclass
+class MediaPost:
+    """账号「自己的」一条带图帖子（``/2/profile/<id>/media`` 里的一项）。"""
+
+    tweet_id: str = ""
+    url: str = ""
+    text: str = ""
+    created_at: str = ""
+    media: list[str] = field(default_factory=list)
+
+
+def build_media_url(handle: str) -> str:
+    """账号最近的带图帖子列表。只包含它自己发的，不含转发。"""
+    user = (handle or "").strip().lstrip("@")
+    if not user or not _HANDLE.match(user):
+        return ""
+    return f"{API_BASE}/2/profile/{user}/media"
+
+
+def parse_media_list(payload: dict | None) -> list[MediaPost]:
+    """把 ``/media`` 的返回拆成一串帖子。
+
+    这个接口是判断「图是不是她自己发的」唯一不花钱的办法：转发页里的图不会
+    出现在列表里，只有亲手发过的才会。所以列表为空就是「她自己没发过」，不能
+    当成「查不到」——但调用方要自己记住窗口只有最近十几条。
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("results")
+    if not isinstance(raw, list):
+        return []
+    posts: list[MediaPost] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        urls: list[str] = []
+        media = item.get("media")
+        if isinstance(media, dict):
+            for entry in media.get("all") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("type") or "") not in ("photo", "video", "gif"):
+                    continue
+                link = str(entry.get("url") or "").strip()
+                if link.startswith("http"):
+                    urls.append(link)
+        if not urls:
+            continue
+        tweet_id = str(item.get("id") or "")
+        posts.append(
+            MediaPost(
+                tweet_id=tweet_id,
+                url=str(item.get("url") or "") or (f"https://x.com/i/status/{tweet_id}" if tweet_id else ""),
+                text=str(item.get("text") or ""),
+                created_at=str(item.get("created_at") or ""),
+                media=urls,
+            )
+        )
+    return posts

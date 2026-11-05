@@ -14,11 +14,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 
+import requests
+
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.config import build_plugin_default_config, merge_plugin_config_data
 from maibot_sdk.types import HookMode, ToolParameterInfo, ToolParamType
 
-from .core import fxtwitter, formatting, grok, resultcache, vision
+from .core import fxtwitter, formatting, grok, handles, paid, resultcache, same_person, vision
 from .core.commands import build_command_pattern, build_more_pattern, split_force
 from .core.config import migrate_legacy_sections
 from .core.engines import (
@@ -32,7 +34,16 @@ from .core.engines import (
     detect_ai,
     verify_candidate,
 )
-from .core.extract import dedupe_accounts, is_pixiv_platform, is_social_platform, is_x_platform
+from .core.extract import (
+    dedupe_accounts,
+    is_pixiv_platform,
+    is_repost_page,
+    is_social_platform,
+    is_x_platform,
+    is_x_post_page,
+    x_page_kind,
+    x_title_name,
+)
 from .core.hashing import dhash, hamming, prepare_upload
 from .core.httpclient import HttpError, download_image_multi, make_session
 from .core.keypool import KeyPool
@@ -1551,6 +1562,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         hits,
                         key=lambda item: (item.distance if item.distance is not None else 999, item.rank),
                     )
+                    # 落在账号主页上的视觉结论撑不起「就是她发的」：翻她自己的帖子
+                    # 比指纹，翻不到就降级，别让用户点进主页对不上图。
+                    settled = await self._settle_vision_handle(best, upload)
+                    if settled is None and best is not None:
+                        vision_info["downgraded"] = int(vision_info.get("downgraded") or 0) + 1
+                    best = settled
+
+        # 引用帖不是原帖：图来自被引用的那条时，结论换成原作者。
+        best = await self._follow_quote(best)
 
         self._vlog(
             "分流结果：路线=%s 原因=%s；匹配=%s 视觉=%s 疑似=%s 不符=%s 未验证=%s",
@@ -1578,6 +1598,39 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 section.engine_timeout,
             )
 
+        # 指纹命中的常是搬运站，作者本人的 X 号不会出现在候选的账号字段里。
+        # 从候选标题里认出疑似名字，去 X 验证存在性；它不改 best、也不覆盖 Grok
+        # 已经核到的号，只作为「同一个人可能在这个号」的补充线索。
+        x_guess: dict[str, Any] | None = None
+        if (
+            upload
+            and ordered
+            and not (grok_info or {}).get("handle")
+            and not (best is not None and self._is_x(best))
+        ):
+            try:
+                x_guess = await self._hunt_x_handle(ordered)
+            except Exception as error:  # noqa: BLE001 - 猜号失败不影响已经搜到的结果
+                self.ctx.logger.warning("疑似 X 账号推断失败：%s", error)
+
+        # 付费内容线索：搬运站和泄露站按名字建页，有页就说明这个人确实在做
+        # OnlyFans。它同样不改 best，只多给一个可以核对的号。
+        paid_info: dict[str, Any] | None = None
+        if upload and ordered:
+            try:
+                paid_info = await self._hunt_paid(ordered)
+            except Exception as error:  # noqa: BLE001 - 查不到付费线索不影响已搜到的结果
+                self.ctx.logger.warning("付费内容线索推断失败：%s", error)
+
+        # 候选里出现两个以上 X 号时，看它们是不是挂着同一条外链：coser 常开好多
+        # 个小号，也常互相转发，同一个 Patreon 指向同一个人，比名字像要硬。
+        same_person_info: dict[str, Any] | None = None
+        if ordered:
+            try:
+                same_person_info = await self._hunt_same_person(ordered)
+            except Exception as error:  # noqa: BLE001 - 对号失败不影响已搜到的结果
+                self.ctx.logger.warning("同一个人多号推断失败：%s", error)
+
         # Grok 给了具体帖子或账号，也算有结论：前者是找到，后者是线索。
         grok_hit = bool(grok_info and grok_info.get("tier") in {"post", "account"})
         outcome = SearchOutcome(
@@ -1593,6 +1646,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             total_candidates=total,
             vision=vision_info,
             grok=grok_info,
+            x_guess=x_guess,
+            paid=paid_info,
+            same_person=same_person_info,
         )
 
         if grok_hit and best is None and upload:
@@ -1758,6 +1814,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
         return is_x_platform(item.platform)
 
     @staticmethod
+    def _is_x_post(item: Candidate) -> bool:
+        """只有具体的帖子页能当原帖；主页、转发/回复列表页不算。"""
+        return is_x_platform(item.platform) and is_x_post_page(item.url)
+
+    @staticmethod
     def _pick_best(ordered: list[Candidate], prefer_pixiv: bool = False) -> Candidate | None:
         matches = [item for item in ordered if item.status == "match"]
         if not matches:
@@ -1775,11 +1836,22 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 matches = pixiv
         hashed = [item for item in matches if item.distance is not None]
         if hashed:
+            closest = min(item.distance for item in hashed if item.distance is not None)
+            # X 优先从「同距离」放宽到「差 1」：搬运站存的是原图，距离往往比 X 上
+            # 被压过的那条低 1~2，死守同距离等于永远轮不到作者本人。差得更多就
+            # 不是同一张图了，不能为了平台把它顶上来。
+            x_first = [
+                item
+                for item in hashed
+                if ImageSearcherPlugin._is_x_post(item)
+                and (item.distance if item.distance is not None else 999) <= closest + 1
+            ]
+            pool = x_first or hashed
             return min(
-                hashed,
+                pool,
                 key=lambda item: (
                     item.distance if item.distance is not None else 999,
-                    0 if ImageSearcherPlugin._is_x(item) else 1,
+                    0 if ImageSearcherPlugin._is_x_post(item) else 1,
                 ),
             )
         return max(matches, key=lambda item: item.similarity or 0)
@@ -1935,7 +2007,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             verdict = vision.verdict_of(candidate.handle, candidate.platform, candidate.url, candidate.name)
             if verdict != vision.VERDICT_VISION:
                 candidate.status = "suspect"
-                candidate.note = vision.DOWNGRADE_NOTES[verdict].format(gap=gap)
+                candidate.note = vision.DOWNGRADE_NOTES[verdict].format(
+                    gap=gap, platform=candidate.platform or "这个站点"
+                )
                 info["downgraded"] += 1
                 continue
             candidate.status = "vision"
@@ -1971,6 +2045,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "reference_url": "",
             "reason": "",
             "model": "",
+            # 图上读到的 ID（水印、签名、帖号）。只是线索：实测读水印会把
+            # @ste11ar021 认成 @butter021，所以它不参与结论，只进日志。
+            "watermark": "",
             "error": "",
             "tools": [],
             "hints": 0,
@@ -1996,30 +2073,62 @@ class ImageSearcherPlugin(MaiBotPlugin):
             info["error"] = f"原图处理失败：{str(error)[:60]}"
             return info
         data_url = "data:image/jpeg;base64," + base64.b64encode(compact).decode("ascii")
-        hints = grok.build_hints(candidates or [])
+        hints = grok.build_hints(grok.social_first(candidates or []))
         info["hints"] = len(hints)
-        body = grok.build_payload(model, data_url, hints=hints)
+        # 候选里出现 /reposts、/likes 这类页面时，必须提前告诉模型「图不是她发的」。
+        # 不说的话它会认下转发者、答「没有原帖」（实测如此）；说清之后它会转去读
+        # 图上的水印，找到真正发帖的号。
+        reposts: list[str] = []
+        for item in candidates or []:
+            url = getattr(item, "url", "") or ""
+            if is_repost_page(url) and url not in reposts:
+                reposts.append(url)
+        repost_note = "、".join(reposts[:3])
+        if reposts:
+            self._vlog("Grok 提示：候选里有转发页 %s", repost_note)
+        body = grok.build_payload(model, data_url, hints=hints, repost_note=repost_note)
         timeout = max(15, int(section.timeout))
         proxy = self.config.plugin.proxy
 
-        def call() -> dict:
+        def call(seconds: int) -> dict:
             session = make_session(proxy, headers={"Authorization": f"Bearer {key}"})
             try:
-                response = session.post(f"{base}/responses", json=body, timeout=timeout)
+                response = session.post(f"{base}/responses", json=body, timeout=seconds)
                 if response.status_code != 200:
                     raise HttpError(f"HTTP {response.status_code}：{response.text[:160]}")
                 return response.json()
             finally:
                 session.close()
 
+        # 中转站偶尔一口气卡满超时（实测那次 Read timed out 120 秒），隔两秒重试
+        # 一次通常就过去了；服务端明确回 4xx/5xx 的不重试，那是请求本身的问题。
+        attempts = [timeout, max(30, min(60, timeout // 2))]
         started = time.time()
-        try:
-            payload = await asyncio.wait_for(asyncio.to_thread(call), timeout=timeout + 5)
-        except asyncio.TimeoutError:
-            info["error"] = f"Grok {timeout} 秒内没返回"
-        except Exception as error:  # noqa: BLE001
-            info["error"] = f"Grok 调用失败：{str(error)[:100]}"
-        else:
+        payload: dict | None = None
+        for index, seconds in enumerate(attempts):
+            try:
+                payload = await asyncio.wait_for(
+                    asyncio.to_thread(call, seconds), timeout=seconds + 5
+                )
+                break
+            except asyncio.TimeoutError:
+                info["error"] = f"中转站 {seconds} 秒内没响应"
+            except Exception as error:  # noqa: BLE001
+                if isinstance(error, requests.exceptions.Timeout):
+                    info["error"] = f"中转站 {seconds} 秒内没响应"
+                elif isinstance(error, requests.exceptions.ConnectionError):
+                    info["error"] = "中转站连不上"
+                else:
+                    info["error"] = f"Grok 调用失败：{str(error)[:100]}"
+                transient = isinstance(
+                    error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+                )
+                if not transient:
+                    break
+            if index + 1 < len(attempts):
+                self._vlog("Grok 这次没成（%s），2 秒后重试一次", info["error"])
+                await asyncio.sleep(2)
+        if payload is not None:
             result = grok.parse_output(payload, model=model)
             info.update(
                 {
@@ -2030,9 +2139,14 @@ class ImageSearcherPlugin(MaiBotPlugin):
                     "reason": result.reason,
                     "model": result.model or model,
                     "tools": result.tools,
+                    "watermark": result.watermark,
                     "error": result.error,
                 }
             )
+            if result.watermark:
+                # 读错的 ID 一旦被当成结论会直接报错人，所以在日志里单独留一行，
+                # 出问题能立刻看出它是「读错了」还是「读对了但没核到帖子」。
+                self._vlog("Grok 图上读到 ID：%s", result.watermark)
             if result.tier == "account" and result.handle:
                 # 只给主页时先确认这个号真的存在；查不到就整条丢掉，宁可报没找到，
                 # 也不要把模型编出来的名字当成线索发出去。
@@ -2090,9 +2204,25 @@ class ImageSearcherPlugin(MaiBotPlugin):
                         info["post_url"] = ""
                         info["reason"] = f"{note}，已丢弃"
 
+        if info["tier"] == "account" and info["handle"] and upload:
+            # 只知道账号、或者它给的帖子对不上时，去翻这个号自己的带图帖子：
+            # 转发不进那个列表，命中的一定是它亲手发的，而且直接给出帖子地址。
+            found = await self._media_lookup(info["handle"], upload)
+            if found:
+                info["tier"] = "post"
+                info["post_url"] = found["url"]
+                info["verified"] = "hit"
+                info["distance"] = found["distance"]
+                note = (
+                    f"翻了 @{info['handle']} 自己的带图帖子，这张图就在里面"
+                    f"（距离 {found['distance']}）"
+                )
+                info["reason"] = f"{note}；{info['reason']}" if info["reason"] else note
+
         self.ctx.logger.info(
-            "Grok 兜底：档位=%s 账号=%s 帖子=%s 核对=%s 候选=%s 工具=%s 耗时=%.1fs 理由=%s%s",
+            "Grok 兜底：档位=%s 图上ID=%s 账号=%s 帖子=%s 核对=%s 候选=%s 工具=%s 耗时=%.1fs 理由=%s%s",
             info["tier"],
+            info["watermark"] or "无",
             info["handle"] or "无",
             info["post_url"] or "无",
             info.get("checked_posts", 0),
@@ -2128,6 +2258,32 @@ class ImageSearcherPlugin(MaiBotPlugin):
         except Exception as error:  # noqa: BLE001 - 拉不到就当核对失败，不影响主流程
             return fxtwitter.Tweet(error=f"拉推文失败：{str(error)[:60]}", tweet_id=tweet_id)
         return fxtwitter.parse_tweet(payload, tweet_id=tweet_id)
+
+    async def _follow_quote(self, best: Candidate | None) -> Candidate | None:
+        """结论落在引用帖上时，换成被引用的原帖。
+
+        fxtwitter 的 ``quote`` 字段直接给出原帖地址与作者。引用帖自己没配图
+        （``media`` 为空）时，候选图只能来自被引用那条——YuMIkAnime 那单就是
+        引用了 @qyuuuz 的图吐槽，结果被当成作者发了出去。自己配了图的不动，
+        那种情况图确实是它发的。
+        """
+        if best is None or not is_x_post_page(best.url or ""):
+            return best
+        tweet = await self._fetch_tweet(best.url)
+        if not tweet.ok or not tweet.quote_url or not tweet.quote_handle:
+            return best
+        if tweet.media:
+            return best
+        former = f"@{tweet.handle}" if tweet.handle else "这条帖子"
+        best.url = tweet.quote_url
+        best.handle = f"@{tweet.quote_handle}"
+        best.name = tweet.quote_name or best.name
+        best.platform = "X (Twitter)"
+        best.source = "X"
+        note = f"原文是 {former} 的引用帖，图来自被引用的 @{tweet.quote_handle}"
+        best.note = f"{best.note}；{note}" if best.note else note
+        self._vlog("引用帖换成原帖：%s → %s", former, best.url)
+        return best
 
     async def _verify_tweet(self, ref: str, upload: bytes | None) -> dict[str, Any]:
         """把推文里的配图和用户原图做指纹比对。
@@ -2226,6 +2382,432 @@ class ImageSearcherPlugin(MaiBotPlugin):
         except Exception:  # noqa: BLE001 - 查不了就当没查成，不影响已经拿到的结论
             return None
 
+    # 翻账号自己的带图帖子时最多看这么多条。这个接口一次只给最近十几条，
+    # 多了请求不出去；够不够用取决于图新不新，翻不到就老实说没有。
+    _MEDIA_SCAN_POSTS = 12
+    _MEDIA_SCAN_IMAGES = 2
+
+    async def _media_lookup(self, handle: str, upload: bytes | None) -> dict[str, Any] | None:
+        """翻账号自己的带图帖子（不含转发），用指纹确认这张图是不是它发的。
+
+        比「让模型给链接」硬在两点：列表里只有本人发的东西，转发进不来；命中时
+        直接拿到那条帖子的地址，不是「疑似这个人」。代价是只看得到最近十几条。
+        """
+        if not upload or not handle:
+            return None
+        url = fxtwitter.build_media_url(handle)
+        if not url:
+            return None
+        timeout = min(20, max(8, int(self.config.plugin.download_timeout) + 6))
+
+        def fetch() -> dict:
+            session = make_session(self._proxy(), headers={"Accept": "application/json"})
+            try:
+                response = session.get(url, timeout=timeout)
+                if response.status_code != 200:
+                    raise HttpError(f"HTTP {response.status_code}")
+                return response.json()
+            finally:
+                session.close()
+
+        try:
+            payload = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=timeout + 4)
+        except Exception as error:  # noqa: BLE001 - 翻不到就不翻，别影响已经拿到的结论
+            self._vlog("翻 @%s 的带图帖子失败：%s", handle, str(error)[:80])
+            return None
+        posts = fxtwitter.parse_media_list(payload)
+        if not posts:
+            self._vlog("翻 @%s 的带图帖子：一条都没拿到", handle)
+            return None
+        mine = dhash(upload)
+        if mine is None:
+            return None
+        threshold = self.config.plugin.hash_threshold
+        best: dict[str, Any] | None = None
+        for post in posts[: self._MEDIA_SCAN_POSTS]:
+            for link in post.media[: self._MEDIA_SCAN_IMAGES]:
+                raw = await self._download(link)
+                if not raw:
+                    continue
+                other = dhash(raw)
+                if other is None:
+                    continue
+                distance = hamming(mine, other)
+                if distance <= threshold and (best is None or distance < best["distance"]):
+                    best = {"url": post.url, "distance": distance, "created_at": post.created_at}
+        self._vlog(
+            "翻 @%s 的带图帖子：%s 条，结论=%s",
+            handle,
+            len(posts),
+            f"命中 distance={best['distance']}" if best else "没有这张图",
+        )
+        return best
+
+    async def _settle_vision_handle(self, best: Candidate | None, upload: bytes | None) -> Candidate | None:
+        """视觉给的是 X 账号主页时，翻这个号自己的帖子核实，翻不到就降级。
+
+        视觉常凭「同款发饰、发尾蓝白渐变、白色长袜」就把人认下来，落地却是
+        ``x.com/<号>`` 这种主页——主页上什么图都有，点进去根本对不上是哪张。
+        实测 s-20261105-1537 那单挑中 `x.com/realpakbupati`，理由是「同款发饰、
+        发尾蓝白渐变」，可那张图是粉发白裙、跟原图的银紫发护士服毫无关系，
+        模型把拼图里别的格的特征套上去了。
+
+        翻到她自己的带图帖且指纹命中，就换成那条帖子；一条都没命中，这条结论
+        就撑不起来，降成疑似。
+        """
+        if best is None or best.status != "vision" or not is_x_platform(best.platform):
+            return best
+        if x_page_kind(best.url or "") != "profile":
+            return best
+        handle = (best.handle or "").strip().lstrip("@")
+        if not handle:
+            return best
+        hit = await self._media_lookup(handle, upload)
+        if hit:
+            best.url = str(hit.get("url") or best.url)
+            best.note = (
+                f"视觉复核：同一个人；翻 @{handle} 自己的帖子找到原帖"
+                f"（指纹距离 {hit.get('distance')}）"
+            )
+            self._vlog("视觉主页换成原帖：%s → %s", handle, best.url)
+            return best
+        best.status = "suspect"
+        best.note = f"视觉复核：疑似同一个人，但没在 @{handle} 最近的带图帖里翻到这张，仅供参考"
+        self._vlog("视觉主页没翻到原帖，降级：%s", handle)
+        return None
+
+    # 从候选标题猜账号时最多验这么多个名字。别名列表常常挤在某一条搬运站
+    # 标题里，前面几条候选的站点名会把名额吃光，所以名额放宽到 20，并按状态
+    # 排序：先看指纹或视觉确实对上的，再看下不到图的社交页（作者本人常在那里），
+    # 视觉觉得像但指纹差得远的排最后。
+    _X_HUNT_LIMIT = 20
+    _X_HUNT_STATUS_ORDER = {"match": 0, "vision": 0, "unverified": 1, "suspect": 2}
+
+    @classmethod
+    def _x_hunt_priority(cls, item: Candidate) -> int:
+        return cls._X_HUNT_STATUS_ORDER.get(item.status, 3)
+
+    # 粉丝数门槛。实测 500 会把几百粉的同名路人（kuuko_w、Medieval）放进来，
+    # 5000 以下即使是真的也很难和同名号区分，宁可漏报。
+    _X_GUESS_MIN_FOLLOWERS = 5000
+
+    async def _profile(self, handle: str) -> dict[str, Any] | None:
+        """查一个 X 账号的公开资料（fxtwitter，免登录）。"""
+        url = f"https://api.fxtwitter.com/2/profile/{handle}"
+        proxy = self._proxy()
+
+        def fetch() -> dict[str, Any] | None:
+            session = make_session(proxy)
+            try:
+                response = session.get(url, timeout=15)
+                if response.status_code != 200:
+                    return None
+                payload = response.json()
+                user = payload.get("user") if isinstance(payload, dict) else None
+                return user if isinstance(user, dict) else None
+            finally:
+                session.close()
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
+        except Exception:  # noqa: BLE001 - 查不到就当没这个号
+            return None
+
+    def _identity_texts(self, ordered: list[Candidate]) -> list[str]:
+        """已经靠图像对上的那几条候选的名字，用来卡住张冠李戴。
+
+        只取 match / vision 两种状态：它们的图跟原图确实像，标题里的名字才可能
+        是作者。一条都对不上时返回空列表，调用方按「不做这道校验」处理，不能
+        因为没对上就什么线索都不给。
+        """
+        picked = [item for item in ordered if item.status in ("match", "vision")]
+        return [
+            f"{item.title} {item.name}"
+            for item in picked[:3]
+            if item.title or item.name
+        ]
+
+    @staticmethod
+    def _name_text(item: Candidate) -> str:
+        """抽名字用的文本。
+
+        X 帖子的标题是「名字 on X: "正文"」，正文里什么词都有——「Happy
+        Halloween!」那单就抽出了 @halloween，还顺手推了 leakgallery.com/Halloween。
+        只留 on X: 前面那截。
+        """
+        title = item.title or ""
+        if is_x_post_page(item.url):
+            title = x_title_name(title)
+        return f"{title} {item.name}"
+
+    async def _hunt_x_handle(self, ordered: list[Candidate]) -> dict[str, Any] | None:
+        """从候选标题里认出疑似 X 账号，验证存在后取粉丝最多的那个。
+
+        搬运站的标题常把作者别名一起抄过来（「Kuuko / kuukow002 / kuuko_w」），
+        这是不调用 Grok 时唯一能拿到作者账号的线索。只认「名字原样出现在标题
+        里」的名字，再要求账号真实存在且粉丝量够；两条都不满足就宁可不给。
+        """
+        # 只看「图确实像」的那几类候选：mismatch 的标题跟这张图无关，里面
+        # 的 Gundam、Azur Lane 之类抽出来全是噪声，还会把名额占满，让真正
+        # 写着作者名的那条（fapello 的「NENEchi890, NERUchi890」）挤不进来。
+        rows = sorted(
+            (
+                item
+                for item in ordered[:12]
+                if (item.title or item.name)
+                and item.status != "mismatch"
+                and not handles.is_blocked_source(item.source)
+            ),
+            key=self._x_hunt_priority,
+        )
+        if not rows:
+            return None
+        # 一条都没对上图（这一单就是「未找到」）时，这些名字只是从噪声标题里抽出
+        # 来的单词，抽中哪个真实存在的大号纯属巧合：实测「Nothing To Hide」抽出
+        # 106 万粉的 @nothing、「Design」抽出 @Design，全跟图无关。没锚点就不猜。
+        anchors = self._identity_texts(ordered)
+        if not anchors:
+            return None
+        texts = [self._name_text(item) for item in rows]
+        names = handles.extract(texts, limit=self._X_HUNT_LIMIT)
+        if not names:
+            return None
+        profiles = await asyncio.gather(*(self._profile(name) for name in names))
+        known = {str(item.handle or "").lower() for item in ordered if item.handle}
+        best: dict[str, Any] | None = None
+        for name, info in zip(names, profiles):
+            if not info:
+                continue
+            followers = int(info.get("followers") or 0)
+            if followers < self._X_GUESS_MIN_FOLLOWERS:
+                continue
+            score = handles.match_score(name, texts)
+            if score <= 0:
+                continue
+            # 候选本身就是这个号时再补一句「疑似同一个人的 X」等于说废话，还会
+            # 让人以为另有一个号。X 候选的 handle 直接从名单里排掉。
+            if name.lower() in known:
+                continue
+            if anchors and not (
+                handles.shares_anchor(name, anchors)
+                or handles.supported_by_context(name, texts, anchors)
+            ):
+                self._vlog("疑似 X 账号：@%s 跟已对上的名字对不上，丢掉", name)
+                continue
+            if best is not None and followers <= best["followers"]:
+                continue
+            lower_name = name.lower()
+            source = next(
+                (
+                    item
+                    for item in rows
+                    if lower_name in self._name_text(item).lower()
+                ),
+                None,
+            ) or next(
+                (
+                    item
+                    for item in rows
+                    if handles.stem(name) in self._name_text(item).lower()
+                ),
+                None,
+            )
+            best = {
+                "handle": str(info.get("screen_name") or name),
+                "followers": followers,
+                "name": str(info.get("name") or "")[:40],
+                "source_url": source.url if source is not None else "",
+                "source_platform": source.platform if source is not None else "",
+                "source_title": " ".join((source.title or source.name or "").split())[:60]
+                if source is not None
+                else "",
+                "score": score,
+            }
+        if best:
+            self._vlog(
+                "疑似 X 账号：@%s 粉丝=%s 来源=%s 标题=%s",
+                best["handle"],
+                best["followers"],
+                best["source_platform"] or "-",
+                best["source_title"] or "-",
+            )
+        return best
+
+    # 泄露站按名字建收录页：有页说明这个人确实在做 OnlyFans，没页返回 404。
+    _PAID_PROBE = "https://leakgallery.com"
+
+    async def _paid_probe(self, name: str) -> dict[str, Any] | None:
+        """查这个名字在泄露站有没有收录页，有就把页面上读到的称呼带回来。"""
+        url = f"{self._PAID_PROBE}/{name}"
+        proxy = self._proxy()
+
+        def fetch() -> tuple[int, str]:
+            session = make_session(proxy)
+            try:
+                response = session.get(url, timeout=15)
+                return response.status_code, response.text or ""
+            finally:
+                session.close()
+
+        try:
+            status, html = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=20)
+        except Exception:  # noqa: BLE001 - 查不了就当没有，不影响已经搜到的结果
+            return None
+        if status != 200:
+            return None
+        info = paid.parse_page(html, name)
+        if not info:
+            return None
+        info["page_url"] = url
+        return info
+
+    async def _hunt_paid(self, ordered: list[Candidate]) -> dict[str, Any] | None:
+        """从候选标题里认出名字，去泄露站确认这个人有 OnlyFans 付费内容。
+
+        名字必须原样出现在候选标题里，再看站上有没有收录页，两道都过才采信。
+        命中后顺带补上 X 和 IG，结果里给的是「同一个人可能在卖的号」，不是原帖。
+        """
+        # 只看「图确实像」的那几类候选：mismatch 的标题跟这张图无关，里面
+        # 的 Gundam、Azur Lane 之类抽出来全是噪声，还会把名额占满，让真正
+        # 写着作者名的那条（fapello 的「NENEchi890, NERUchi890」）挤不进来。
+        rows = sorted(
+            (
+                item
+                for item in ordered[:12]
+                if (item.title or item.name)
+                and item.status != "mismatch"
+                and not handles.is_blocked_source(item.source)
+            ),
+            key=self._x_hunt_priority,
+        )
+        if not rows:
+            return None
+        # 跟疑似 X 账号同一条道理：一条都对不上图时，名字只是从噪声标题里抽出来的
+        # 单词，命中的泄露站页面也是别人的。
+        anchors = self._identity_texts(ordered)
+        if not anchors:
+            return None
+        texts = [self._name_text(item) for item in rows]
+        names = handles.extract(texts, limit=self._X_HUNT_LIMIT)
+        if not names:
+            return None
+        pages = await asyncio.gather(*(self._paid_probe(name) for name in names))
+        known = {str(item.handle or "").lower() for item in ordered if item.handle}
+        best: dict[str, Any] | None = None
+        for name, info in zip(names, pages):
+            if not info:
+                continue
+            score = handles.match_score(name, texts)
+            if score <= 0:
+                continue
+            if name.lower() in known:
+                continue
+            if anchors and not (
+                handles.shares_anchor(name, anchors)
+                or handles.supported_by_context(name, texts, anchors)
+            ):
+                self._vlog("付费线索：%s 跟已对上的名字对不上，丢掉", name)
+                continue
+            # 名字越长越具体，同一批里取最具体的那个，避免短词命中别人的页。
+            if best is not None and score <= best["score"]:
+                continue
+            lower = name.lower()
+            stem = handles.stem(name)
+            source = next(
+                (item for item in rows if lower in self._name_text(item).lower()),
+                None,
+            ) or next(
+                (item for item in rows if stem in self._name_text(item).lower()),
+                None,
+            )
+            best = {
+                "handle": name,
+                "name": str(info.get("name") or name)[:40],
+                "page_url": str(info.get("page_url") or ""),
+                "source_url": source.url if source is not None else "",
+                "source_platform": source.platform if source is not None else "",
+                "source_title": " ".join((source.title or source.name or "").split())[:60]
+                if source is not None
+                else "",
+                "score": score,
+                "x_handle": "",
+                "x_followers": 0,
+                "instagram": "",
+            }
+        if not best:
+            return None
+        profile = await self._profile(best["handle"])
+        if profile:
+            best["x_handle"] = str(profile.get("screen_name") or "")
+            best["x_followers"] = int(profile.get("followers") or 0)
+            best["instagram"] = paid.instagram_of(profile)
+        self._vlog(
+            "疑似付费内容：%s 来源=%s X=%s IG=%s 标题=%s",
+            best["handle"],
+            best["source_platform"] or "-",
+            best["x_handle"] or "-",
+            best["instagram"] or "-",
+            best["source_title"] or "-",
+        )
+        return best
+
+    # 最多核对这么多个 X 号的外链。候选里同时出现好几个 X 号的情况不多，6 个够用。
+    _SAME_PERSON_LIMIT = 6
+
+    async def _hunt_same_person(self, ordered: list[Candidate]) -> dict[str, Any] | None:
+        """候选里出现两个以上 X 号时，看它们是否挂着同一条外链。
+
+        coser 常开好几个号，也常互相转发；靠转发关系分不清谁是谁，但同一个
+        收款页（Patreon 之类）指向同一个人，这条不靠猜名字。
+
+        但「谁跟谁是一个人」和「谁是这张图的作者」是两件事。所以只把跟这张图
+        有关系的号拉进来比：指纹明确对不上的（mismatch）本来就不是这张图的
+        结果，凑进来就是把无关的人挂在结论下面。
+        """
+        pairs: list[tuple[str, str]] = []
+        anchors: set[str] = set()
+        for item in ordered:
+            if not self._is_x(item):
+                continue
+            handle = str(item.handle or "").strip().lstrip("@")
+            if not handle:
+                continue
+            status = str(item.status or "")
+            pairs.append((handle, status))
+            if status in same_person.TRUSTED:
+                anchors.add(handle.lower())
+        handles_seen = same_person.eligible(pairs)[: self._SAME_PERSON_LIMIT]
+        if len(handles_seen) < 2:
+            return None
+        profiles = await asyncio.gather(*(self._profile(handle) for handle in handles_seen))
+        table = {
+            handle.lower(): profile
+            for handle, profile in zip(handles_seen, profiles)
+            if isinstance(profile, dict) and profile
+        }
+        groups = same_person.find_shared(table, anchors=anchors)
+        if not groups:
+            return None
+        top = groups[0]
+        members = []
+        for handle in top["handles"]:
+            info = table.get(handle) or {}
+            members.append(
+                {
+                    "handle": str(info.get("screen_name") or handle),
+                    "name": str(info.get("name") or "")[:40],
+                    "followers": int(info.get("followers") or 0),
+                    "tied": handle in anchors,
+                }
+            )
+        members.sort(key=lambda item: -item["followers"])
+        self._vlog(
+            "同一个人多号：%s 依据=%s",
+            "、".join("@" + item["handle"] for item in members),
+            top["link"],
+        )
+        return {"link": top["link"], "members": members}
+
     def _rank(
         self,
         candidates: list[Candidate],
@@ -2247,7 +2829,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 order.get(item.engine, 99),
                 item.rank,
                 distance,
-                0 if self._is_x(item) else 1,
+                0 if self._is_x_post(item) else 1,
                 similarity,
             )
 
@@ -2428,8 +3010,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 )
             ]
         else:
-            # 视觉、Grok 各自一条，页脚（任务编号、更多、重搜）单独一条：
-            # 两种来源的结论和配图挤在一条里，用户分不清哪张属于哪个判断。
+            # 视觉、Grok、页脚各占一个节点，最后塞进同一条合并转发：
+            # 两种来源的结论和配图挤在一个节点里，用户分不清哪张属于哪个判断。
             blocks = formatting.build_result_forwards(
                 task,
                 command=COMMAND,
@@ -2443,6 +3025,21 @@ class ImageSearcherPlugin(MaiBotPlugin):
 
         delivered = 0
         last_error: Exception | None = None
+        merged = [node for block in blocks for node in block]
+        image_count = formatting.count_forward_images(merged)
+        # 视觉、Grok、页脚三条塞进同一条合并转发：群里只出一条消息，点开是三条。
+        # 图多到会被 NapCat 拒收时（实测 6 张能过、13 张失败）还是逐条发，
+        # 宁可多出几条消息，也别让整条转发失败。
+        if len(blocks) > 1 and image_count <= self._MAX_FORWARD_IMAGES:
+            self._vlog(
+                "合并转发合并发送：task=%s 块=%s 节点=%s 图=%s",
+                task.task_id,
+                len(blocks),
+                len(merged),
+                image_count,
+            )
+            blocks = [merged]
+
         for index, nodes in enumerate(blocks, start=1):
             try:
                 sent = await self.ctx.send.forward(nodes, task.stream_id)

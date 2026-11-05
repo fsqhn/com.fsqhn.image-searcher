@@ -218,6 +218,53 @@ class VisionDisplayTest(unittest.TestCase):
             vision.VERDICT_COMMERCE,
         )
 
+    def test_repost_page_is_not_her_post(self):
+        """转发页上出现的是别人的图，coser 之间互相转发很常见。"""
+        self.assertEqual(
+            vision.verdict_of("@NENEchi8890", "X (Twitter)", "https://x.com/NENEchi8890/reposts"),
+            vision.VERDICT_REPOST,
+        )
+        self.assertEqual(
+            vision.verdict_of("@someone", "X (Twitter)", "https://x.com/someone/likes"),
+            vision.VERDICT_REPOST,
+        )
+        # 帖子页照常算结论。
+        self.assertEqual(
+            vision.verdict_of("@someone", "X (Twitter)", "https://x.com/someone/status/1"),
+            vision.VERDICT_VISION,
+        )
+
+    def test_vision_reason_is_shown(self):
+        """把模型理由亮出来：它按服装判的还是认了脸，用户一眼能分辨。"""
+        item = Candidate(
+            engine="lens",
+            url="https://x.com/someone/status/1",
+            platform="X (Twitter)",
+            handle="@someone",
+            name="someone",
+            distance=11,
+            status="vision",
+            note="视觉复核：同一个人（指纹距离 11，超过阈值 8）",
+        )
+        outcome = SearchOutcome(
+            status="ok",
+            best=item,
+            candidates=[item],
+            vision={"ok": True, "checked": 16, "reason": "同款帽子、斗篷、短裤，腿部姿势一致"},
+        )
+        text = formatting._best_block(outcome)
+        self.assertIn("它给的理由", text)
+        self.assertIn("同款帽子", text)
+
+    def test_untrusted_note_names_the_site(self):
+        """降级文案要点出这页是什么站，否则用户点进去发现不是社交主页。"""
+        note = vision.DOWNGRADE_NOTES[vision.VERDICT_UNTRACEABLE].format(
+            gap="指纹距离 28，超过阈值 8", platform="soundcloud.com"
+        )
+        self.assertIn("soundcloud.com", note)
+        self.assertIn("不是作者主页", note)
+        self.assertIn("仅供参考", note)
+
     def test_not_found_reports_downgraded_picks(self):
         """视觉挑中的都被降级时，不能说「没有发现同一个人」。"""
         outcome = SearchOutcome(

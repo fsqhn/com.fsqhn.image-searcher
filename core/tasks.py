@@ -41,6 +41,17 @@ class SearchOutcome:
     # Grok 兜底：{"ok", "tier", "handle", "post_url", "reason", "model", "tools", "error"}。
     # tier 为 post 表示拿到具体帖子，account 表示只拿到账号主页。
     grok: dict | None = None
+    # 从候选标题里推出来的疑似 X 账号：{"handle", "followers", "name", "source_url",
+    # "source_title", "score"}。它不改 best，只作为「同一个人可能在这个号」的补充，
+    # 因为名字推断不等于原帖。
+    x_guess: dict | None = None
+    # 疑似本人的付费内容线索：{"handle", "name", "page_url", "x_handle", "x_followers",
+    # "instagram", "source_platform", "source_title", "score"}。泄露站按名字建收录页，
+    # 有页说明这个人确实在做 OnlyFans，但仍然是同一个人而不是这张图的原帖。
+    paid: dict | None = None
+    # 候选里两个 X 号挂着同一条外链：{"link", "members": [{handle, name, followers}]}。
+    # 同一个人的几个号常指向同一个 Patreon，这条比「名字像」硬。
+    same_person: dict | None = None
     # 展示用图片：候选图地址 → base64。只留在内存里，落盘不保存（体积太大）。
     images: dict[str, str] = field(default_factory=dict)
     # 这次结果来自按图缓存。命中时不重跑引擎，elapsed_ms 是当初那次的耗时。
@@ -63,6 +74,9 @@ class SearchOutcome:
             "image_source": self.image_source,
             "vision": self.vision,
             "grok": self.grok,
+            "x_guess": self.x_guess,
+            "paid": self.paid,
+            "same_person": self.same_person,
         }
 
     @classmethod
@@ -84,6 +98,9 @@ class SearchOutcome:
             image_source=str(summary.get("image_source") or ""),
             vision=summary.get("vision"),
             grok=summary.get("grok"),
+            x_guess=summary.get("x_guess"),
+            paid=summary.get("paid"),
+            same_person=summary.get("same_person"),
         )
 
 

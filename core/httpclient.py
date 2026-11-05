@@ -107,6 +107,19 @@ def is_transient_error(error: BaseException) -> bool:
     return any(hint in text for hint in _RETRY_HINTS)
 
 
+def referer_of(url: str) -> str:
+    """用图片地址自己的站点根作 Referer。
+
+    v2ph、fapello 这类图床会拦「没有来源页」的请求：裸下 403，带上自己域名的
+    Referer 就 200（实测 3 条全救回）。TikTok、Patreon 的图带什么都不行，那是
+    带签名的地址，属于另一回事。
+    """
+    parts = urlparse((url or "").strip())
+    if not parts.scheme or not parts.netloc:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}/"
+
+
 def download_image_multi(url: str, proxy: str = "", timeout: float = 15.0, attempts: int = 3) -> bytes:
     """下载图片，失败时换线路并重试。
 
@@ -127,16 +140,25 @@ def download_image_multi(url: str, proxy: str = "", timeout: float = 15.0, attem
                 break
             if index + 1 < total:
                 time.sleep(0.3)
+    # 403 说明不是线路问题，而是对端要来源页；4xx 上面已经不再重试，
+    # 这里换带 Referer 的姿势再试一次，能救回 v2ph、fapello 这类图床。
+    if last_error is not None and "403" in str(last_error):
+        origin = referer_of(url)
+        if origin:
+            try:
+                return download_image(url, routes[0], timeout, referer=origin)
+            except HttpError as exc:
+                last_error = exc
     raise last_error or HttpError("图片下载失败")
 
 
-def download_image(url: str, proxy: str = "", timeout: float = 15.0) -> bytes:
+def download_image(url: str, proxy: str = "", timeout: float = 15.0, referer: str = "") -> bytes:
     """下载候选图，返回原始字节；超过大小上限直接放弃。"""
     if not url:
         raise HttpError("图片地址为空")
     if not is_public_url(url):
         raise HttpError("图片地址不是公网 http(s)，已拒绝")
-    session = make_session(proxy, headers={"Referer": ""})
+    session = make_session(proxy, headers={"Referer": referer})
     try:
         with session.get(url, timeout=timeout, stream=True) as resp:
             if resp.status_code != 200:

@@ -8,6 +8,7 @@ from unittest import mock
 
 from PIL import Image
 
+from core import httpclient
 from core.hashing import dhash, prepare_upload
 from core.httpclient import HttpError, download_image_multi, download_routes, is_public_url, is_transient_error
 
@@ -109,12 +110,42 @@ class DownloadRetryTest(unittest.TestCase):
         self.assertEqual(data, b"image")
         self.assertEqual(calls, ["", proxy])
 
-    def test_client_error_is_not_retried(self) -> None:
+    def test_403_retries_once_with_referer(self) -> None:
+        """403 是图床要来源页，不是线路问题：带 Referer 再试一次。"""
         calls = []
 
-        def fake_download(url, route="", timeout=15.0):
-            calls.append(route)
+        def fake_download(url, route="", timeout=15.0, referer=""):
+            calls.append(referer)
+            if not referer:
+                raise HttpError("HTTP 403")
+            return b"image"
+
+        with mock.patch("core.httpclient.download_image", side_effect=fake_download):
+            data = download_image_multi("https://fapello.com/content/a.jpg", "http://127.0.0.1:6789", timeout=1)
+
+        self.assertEqual(data, b"image")
+        self.assertEqual(calls, ["", "https://fapello.com/"])
+
+    def test_403_is_retried_only_once(self) -> None:
+        """带 Referer 还是 403 就放弃，不要无休止地打对端。"""
+        calls = []
+
+        def fake_download(url, route="", timeout=15.0, referer=""):
+            calls.append(referer)
             raise HttpError("HTTP 403")
+
+        with mock.patch("core.httpclient.download_image", side_effect=fake_download):
+            with self.assertRaises(HttpError):
+                download_image_multi("https://cdn.donmai.us/a.jpg", "http://127.0.0.1:6789", timeout=1)
+
+        self.assertEqual(len(calls), 2)
+
+    def test_404_is_not_retried(self) -> None:
+        calls = []
+
+        def fake_download(url, route="", timeout=15.0, referer=""):
+            calls.append(referer)
+            raise HttpError("HTTP 404")
 
         with mock.patch("core.httpclient.download_image", side_effect=fake_download):
             with self.assertRaises(HttpError):
@@ -131,3 +162,18 @@ class DownloadRetryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefererTest(unittest.TestCase):
+    """403 的图床要靠来源页放行：v2ph、fapello 裸下 403、带 Referer 200。"""
+
+    def test_origin_from_image_url(self) -> None:
+        self.assertEqual(
+            httpclient.referer_of("https://fapello.com/content/n/o/x/1000/x_0223_300px.jpg"),
+            "https://fapello.com/",
+        )
+        self.assertEqual(httpclient.referer_of("http://cdn.v2ph.com/photos/a.jpg"), "http://cdn.v2ph.com/")
+
+    def test_invalid(self) -> None:
+        self.assertEqual(httpclient.referer_of(""), "")
+        self.assertEqual(httpclient.referer_of("not-a-url"), "")

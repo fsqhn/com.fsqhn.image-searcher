@@ -114,6 +114,50 @@ class VerifyFallbackTest(unittest.TestCase):
         self.assertIn("下载失败", result.note)
 
 
+class XPageKindTest(unittest.TestCase):
+    """X 的主页、回复列表页不能当原帖：图是别人发的。"""
+
+    def _png(self) -> bytes:
+        from io import BytesIO
+
+        from PIL import Image
+
+        buffer = BytesIO()
+        Image.new("RGB", (32, 32), (200, 120, 60)).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def _verify(self, url: str):
+        from unittest.mock import patch
+
+        from core.hashing import dhash
+
+        raw = self._png()
+        candidate = Candidate(engine="lens", url=url, image_url="https://cdn.example.com/a.jpg")
+        with patch("core.engines.download_image_multi", return_value=raw):
+            return verify_candidate(candidate, dhash(raw), 8, "", 5)
+
+    def test_replies_page_is_not_the_original_post(self) -> None:
+        """s-20261105-1423 的实况：把 AlbertGreen69 的回复列表页当成原帖主。"""
+        result = self._verify("https://x.com/AlbertGreen69/with_replies")
+        self.assertEqual(result.status, "suspect")
+        self.assertIn("回复列表页", result.note)
+        self.assertIn("指纹一致（距离 0）", result.note)
+
+    def test_profile_page_is_not_a_post(self) -> None:
+        result = self._verify("https://x.com/NENEchi8890")
+        self.assertEqual(result.status, "suspect")
+        self.assertIn("账号主页", result.note)
+
+    def test_status_page_still_matches(self) -> None:
+        result = self._verify("https://x.com/NERUchi890/status/2117586176714612824")
+        self.assertEqual(result.status, "match")
+        self.assertEqual(result.note, "指纹一致（距离 0）")
+
+    def test_non_x_page_unaffected(self) -> None:
+        result = self._verify("https://nudogram.com/models/nenechi890/290/")
+        self.assertEqual(result.status, "match")
+
+
 class LensRetryTest(unittest.TestCase):
     """Lens 对同一张图会随机返回 0 条，空返回必须重试，有结果就立刻停。"""
 

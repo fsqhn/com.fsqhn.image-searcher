@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import unittest
 
+from core import formatting
 from core.engines import Candidate
 from core.formatting import (
     build_engine_forward_nodes,
     build_forward_nodes,
     build_result_forwards,
     build_text_summary,
+    count_forward_images,
     engine_groups,
     stale_image_hint,
     ttl_text,
@@ -560,11 +562,251 @@ class SplitForwardsTest(unittest.TestCase):
         self.assertNotIn("X 搜索指向这个账号", tail)
         self.assertIn("任务编号", tail)
 
+    def test_not_found_suspects_say_distance_range(self) -> None:
+        """未找到时的疑似条目要说清是同角色/同款，并标出指纹距离区间。"""
+        low = Candidate(engine="yandex", url="https://example.com/a", distance=24, status="suspect")
+        low.finalize()
+        high = Candidate(engine="yandex", url="https://example.com/b", distance=31, status="suspect")
+        high.finalize()
+        outcome = SearchOutcome(
+            status="not_found",
+            candidates=[low, high],
+            total_candidates=2,
+        )
+        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        tail = "\n".join(
+            part["content"]
+            for node in blocks[-1]
+            for part in node.get("content") or []
+            if part["type"] == "text"
+        )
+        self.assertIn("另有 2 条是同角色或同款服装的图", tail)
+        self.assertIn("指纹距离 24～31", tail)
+        self.assertNotIn("疑似同图", tail)
+
+    def test_three_messages_fit_in_one_forward(self) -> None:
+        """三条合起来只有两张图，能塞进同一条合并转发（NapCat 单条约 6 张）。"""
+        blocks = build_result_forwards(_task(self._make_outcome()), command="盆地找鸡")
+        merged = [node for block in blocks for node in block]
+        self.assertEqual(len(merged), 3)
+        self.assertEqual(count_forward_images(merged), 2)
+        self.assertLessEqual(count_forward_images(merged), 6)
+
     def test_no_fallback_content_stays_single_message(self) -> None:
         outcome = self._make_outcome(with_grok=False, best=False)
         outcome.grok = {"ok": True, "tier": "none", "error": ""}
         blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
         self.assertEqual(len(blocks), 1)
+
+
+class XGuessTest(unittest.TestCase):
+    """疑似 X 账号：必须带上「从哪条候选推出来的」，并说明不是原帖。"""
+
+    def _make_outcome(self, *, with_grok: bool = False) -> SearchOutcome:
+        item = Candidate(
+            engine="lens",
+            url="https://galleryepic.com/en/cosplay/5881",
+            distance=2,
+            status="match",
+            platform="galleryepic.com",
+            name="KuukoW – Nahida Cosplay",
+        )
+        item.finalize()
+        return SearchOutcome(
+            status="ok",
+            best=item,
+            candidates=[item],
+            grok={"tier": "account", "handle": "Kuukow002"} if with_grok else None,
+            x_guess={
+                "handle": "Kuukow002",
+                "followers": 1508263,
+                "source_platform": "masterfap.net",
+                "source_title": "Kuuko / kuukow002 / kuuko_w Nude OnlyFans Leak Picture",
+            },
+        )
+
+    def test_shows_source_and_says_not_original(self) -> None:
+        text = formatting._best_block(self._make_outcome())
+        self.assertIn("@Kuukow002", text)
+        # 账号后面直接给主页地址，方便点开核对；不要包在括号里。
+        self.assertIn("@Kuukow002 https://x.com/Kuukow002（粉丝 150.8 万）", text)
+        self.assertIn("150.8 万", text)
+        self.assertIn("masterfap.net", text)
+        self.assertIn("kuukow002", text)
+        self.assertIn("不是这张图的原帖", text)
+        # 原始结果仍然在，不能被疑似账号替换掉。
+        self.assertIn("galleryepic.com/en/cosplay/5881", text)
+
+    def test_hidden_when_grok_names_the_same_handle(self) -> None:
+        text = formatting._best_block(self._make_outcome(with_grok=True))
+        self.assertNotIn("疑似同一个人的 X", text)
+
+
+class ForumTitleTest(unittest.TestCase):
+    """论坛帖的标题不能写成「名字」：inven 那单发了串韩文帖子标题出去。"""
+
+    def test_forum_title_is_labelled_as_title(self) -> None:
+        item = Candidate(
+            engine="lens",
+            url="https://www.inven.co.kr/board/lostark/6271/4036037",
+            distance=1,
+            status="match",
+            platform="inven.co.kr",
+            name="ㅇㅎ)키가 크고싶은 코스어 | 로아 인벤",
+        )
+        item.finalize()
+        outcome = SearchOutcome(status="ok", best=item, candidates=[item])
+        text = formatting._best_block(outcome)
+        self.assertIn("📄 标题：ㅇㅎ", text)
+        self.assertNotIn("👤 名字：", text)
+
+    def test_social_page_still_shows_name(self) -> None:
+        item = Candidate(
+            engine="lens",
+            url="https://x.com/NERUchi890/status/2117586176714612824",
+            distance=0,
+            status="match",
+            platform="X (Twitter)",
+            name="NERU",
+        )
+        item.finalize()
+        outcome = SearchOutcome(status="ok", best=item, candidates=[item])
+        self.assertIn("👤 名字：NERU", formatting._best_block(outcome))
+
+
+class PaidGuessTest(unittest.TestCase):
+    """付费内容线索：给主页、X、IG，但必须说清不是原帖。"""
+
+    def _make_outcome(self) -> SearchOutcome:
+        item = Candidate(
+            engine="lens",
+            url="https://de.hentai-cosplay-xxx.com/image/dreamtamu-bride-vermeil/",
+            distance=0,
+            status="match",
+            platform="de.hentai-cosplay-xxx.com",
+            name="Dreamtamu - Bride Vermeil - Hentai Cosplay",
+        )
+        item.finalize()
+        return SearchOutcome(
+            status="ok",
+            best=item,
+            candidates=[item],
+            paid={
+                "handle": "dreamtamu",
+                "name": "Dream Tamu",
+                "page_url": "https://leakgallery.com/dreamtamu",
+                "x_handle": "DreamTamuu",
+                "x_followers": 16560,
+                "instagram": "https://instagram.com/dream_tamu_",
+                "source_platform": "de.hentai-cosplay-xxx.com",
+                "source_title": "Dreamtamu - Bride Vermeil - Hentai Cosplay",
+            },
+        )
+
+    def test_shows_profile_x_and_instagram(self) -> None:
+        text = formatting._best_block(self._make_outcome())
+        self.assertIn("疑似同一个人的 OnlyFans：Dream Tamu", text)
+        self.assertIn("https://onlyfans.com/dreamtamu", text)
+        self.assertIn("https://x.com/DreamTamuu", text)
+        self.assertIn("1.7 万", text)
+        self.assertIn("https://instagram.com/dream_tamu_", text)
+        self.assertIn("https://leakgallery.com/dreamtamu", text)
+        self.assertIn("不是这张图的原帖", text)
+        # 原始结果仍然在，不能被付费线索替换掉。
+        self.assertIn("hentai-cosplay-xxx.com/image/dreamtamu-bride-vermeil", text)
+
+    def test_absent_when_no_paid_info(self) -> None:
+        text = formatting._best_block(SearchOutcome(status="ok", candidates=[]))
+        self.assertNotIn("OnlyFans", text)
+
+
+class GrokMissTest(unittest.TestCase):
+    """Grok 跑了但没找到时要给一句交代，否则分不清「没跑」和「跑了没结果」。"""
+
+    def _make(self, tier: str = "none", ok: bool = True) -> SearchOutcome:
+        return SearchOutcome(
+            status="ok",
+            candidates=[],
+            grok={"ok": ok, "tier": tier, "handle": "", "reason": "图无文字ID，X 搜无此原图帖"},
+        )
+
+    def test_miss_line_appended(self) -> None:
+        text = formatting._best_block(self._make())
+        self.assertIn("Grok 也拿这张图去 X 搜过，没撞见原帖", text)
+
+    def test_not_added_when_grok_has_a_result(self) -> None:
+        text = formatting._best_block(self._make(tier="account"))
+        self.assertNotIn("没撞见原帖", text)
+
+    def test_not_added_when_grok_failed(self) -> None:
+        text = formatting._best_block(self._make(ok=False))
+        self.assertNotIn("没撞见原帖", text)
+
+    def test_vision_block_carries_the_line(self) -> None:
+        item = Candidate(
+            engine="lens",
+            url="https://x.com/someone/status/1",
+            distance=28,
+            status="vision",
+            platform="X (Twitter)",
+            name="someone",
+        )
+        item.finalize()
+        outcome = SearchOutcome(status="ok", best=item, candidates=[item], grok={"ok": True, "tier": "none"})
+        block = formatting._vision_block(outcome)
+        self.assertIsNotNone(block)
+        self.assertIn("没撞见原帖", block[0]["content"])
+
+
+class SamePersonTest(unittest.TestCase):
+    """几个号挂同一条外链：结论要带依据。"""
+
+    def _make(self) -> SearchOutcome:
+        item = Candidate(
+            engine="lens",
+            url="https://x.com/NENEchi8890/reposts",
+            distance=28,
+            status="vision",
+            platform="X (Twitter)",
+            name="NERU",
+            handle="@NENEchi8890",
+        )
+        item.finalize()
+        return SearchOutcome(
+            status="ok",
+            best=item,
+            candidates=[item],
+            same_person={
+                "link": "patreon.com/NENE318",
+                "members": [
+                    {"handle": "NENEchi8890", "name": "NERU", "followers": 185456},
+                    {"handle": "haru007312", "name": "nene", "followers": 59411},
+                ],
+            },
+        )
+
+    def test_lists_both_accounts_with_the_link(self) -> None:
+        text = formatting._best_block(self._make())
+        self.assertIn("这2个号是同一个人", text)
+        self.assertIn("@NENEchi8890（18.5 万）", text)
+        self.assertIn("@haru007312（5.9 万）", text)
+        self.assertIn("patreon.com/NENE318", text)
+
+    def test_says_it_is_not_the_author(self) -> None:
+        """同一个人 ≠ 这张图的作者，必须写清楚，否则等于把无关的人挂到结论下面。"""
+        text = formatting._best_block(self._make())
+        self.assertIn("不表示他们就是这张图的作者", text)
+
+    def test_marks_the_account_tied_to_the_image(self) -> None:
+        outcome = self._make()
+        outcome.same_person["members"][0]["tied"] = True
+        text = formatting._best_block(outcome)
+        self.assertIn("@NENEchi8890（18.5 万，跟这张图对上的那条）", text)
+        self.assertNotIn("@haru007312（5.9 万，跟这张图", text)
+
+    def test_absent_without_a_group(self) -> None:
+        text = formatting._best_block(SearchOutcome(status="ok", candidates=[]))
+        self.assertNotIn("个号是同一个人", text)
 
 
 if __name__ == "__main__":

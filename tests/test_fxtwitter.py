@@ -100,6 +100,30 @@ class ParseTweetTest(unittest.TestCase):
         self.assertFalse(fxtwitter.parse_tweet({"code": 200}).ok)
         self.assertFalse(fxtwitter.parse_tweet(None).ok)
 
+    def test_parses_quote_author(self) -> None:
+        """纯引用帖要能拿到被引用那条的作者，否则会把引用者当成作者。"""
+        payload = {
+            "code": 200,
+            "tweet": {
+                "id": "2117959676180701586",
+                "url": "https://x.com/YuMIkAnime/status/2117959676180701586",
+                "author": {"screen_name": "YuMIkAnime", "name": "□카"},
+                "media": None,
+                "quote": {
+                    "url": "https://x.com/qyuuuz/status/2117875583355076703",
+                    "id": "2117875583355076703",
+                    "text": "138cm 합법로리 탐정",
+                    "author": {"screen_name": "qyuuuz", "name": "uewe"},
+                },
+            },
+        }
+        tweet = fxtwitter.parse_tweet(payload)
+        self.assertEqual(tweet.media, [])
+        self.assertEqual(tweet.quote_url, "https://x.com/qyuuuz/status/2117875583355076703")
+        self.assertEqual(tweet.quote_handle, "qyuuuz")
+        self.assertEqual(tweet.quote_name, "uewe")
+        self.assertEqual(tweet.quote_text, "138cm 합법로리 탐정")
+
 
 class JudgeTest(unittest.TestCase):
     """链接核对的三态：命中、对不上、没法判断。"""
@@ -113,3 +137,50 @@ class JudgeTest(unittest.TestCase):
     def test_unknown_when_no_distance(self) -> None:
         self.assertEqual(fxtwitter.judge([], 8), "unknown")
         self.assertEqual(fxtwitter.judge([-1], 8), "unknown")
+
+
+class MediaListTest(unittest.TestCase):
+    """账号自己的带图帖子：用来证明「这张图是不是本人发的」。"""
+
+    def test_build_url(self) -> None:
+        self.assertEqual(
+            fxtwitter.build_media_url("@NERUchi890"),
+            "https://api.fxtwitter.com/2/profile/NERUchi890/media",
+        )
+        self.assertEqual(fxtwitter.build_media_url(""), "")
+        self.assertEqual(fxtwitter.build_media_url("a/b"), "")
+
+    def test_parse_photos(self) -> None:
+        payload = {
+            "code": 200,
+            "results": [
+                {
+                    "id": "2117586176714612824",
+                    "url": "https://x.com/NERUchi890/status/2117586176714612824",
+                    "text": "どこ見てるの",
+                    "created_at": "Wed Nov 04 12:01:16 +0000 2026",
+                    "media": {
+                        "all": [
+                            {
+                                "type": "photo",
+                                "url": "https://pbs.twimg.com/media/HWMtZrJbcAA82KO.jpg",
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+        posts = fxtwitter.parse_media_list(payload)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0].tweet_id, "2117586176714612824")
+        self.assertEqual(posts[0].url, "https://x.com/NERUchi890/status/2117586176714612824")
+        self.assertEqual(posts[0].media, ["https://pbs.twimg.com/media/HWMtZrJbcAA82KO.jpg"])
+
+    def test_skip_items_without_media(self) -> None:
+        """纯文字帖不参与比图，留着只会白占名额。"""
+        payload = {"results": [{"id": "1", "text": "纯文字", "media": {"all": []}}]}
+        self.assertEqual(fxtwitter.parse_media_list(payload), [])
+
+    def test_bad_payload(self) -> None:
+        self.assertEqual(fxtwitter.parse_media_list(None), [])
+        self.assertEqual(fxtwitter.parse_media_list({"code": 404}), [])
