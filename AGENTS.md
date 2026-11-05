@@ -209,3 +209,5 @@ python -m unittest discover -s tests -v
 - 不提交个人环境定制值（改过的 `command`、`nickname`、代理地址、`db_full_groups` 里的真实群号）。
 - **截图必须脱敏**：群名、昵称、头像、账号、露骨标题都要遮盖；真人裸露照片不要放原图，效果图优先用虚构字段的示意图。
 - 提交前扫一遍：`grep -rn "@[A-Za-z0-9_]\{2,\}" README.md AGENTS.md` 与 `grep -rn "127.0.0.1\|OnlyFans" README.md`。
+- **Release 正文里的 `@handle` 会被 GitHub 当成用户提及**：写成 `@qyuuuz` 这种，Release 页面底部会自动长出一个 Contributors 区，列出被艾特到的真实 GitHub 账号——连占位符 `@xxx` 都能命中。所有 handle 一律用反引号包起来（写作 `` `@qyuuuz` ``），发完用 API 拉一次正文，确认没有任何裸露的 `@`。
+
