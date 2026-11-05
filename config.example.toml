@@ -41,7 +41,8 @@ social_verify_limit = 20
 
 # 深度检索：打开后每个引擎不只取前几条，而是按 deep_scan_limit 尽量多取，
 # 并在验证阶段按 deep_verify_top_n 多比对几张。命中率更高，耗时大约翻倍。
-deep_scan = false
+# 默认打开——实测漏掉原帖的主要原因是候选没取够；嫌慢可以设成 false。
+deep_scan = true
 deep_scan_limit = 20
 deep_verify_top_n = 8
 # 深度检索时回复「更多」，每个引擎最多列几条。深度取到的比平时多，

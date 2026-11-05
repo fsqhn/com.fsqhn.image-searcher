@@ -99,7 +99,7 @@ core/maibot_compat.py  能力返回值解包
 
 **分流在验证之前**：`_sauce_route()` 只看相似度、不下载图片，所以在 `_verify()` 之前调用。判成插画后不再逐张比对：其他引擎各留 `drawing_other_limit` 条参考、状态保持 `unverified`，最佳匹配从 SauceNAO 的 `match` 里挑，并优先 pixiv 主站（`is_pixiv_platform()`）。
 
-**取数分两档**：`deep_scan=false` 时每引擎取 `max_results` 条、验证 `verify_top_n`（Lens 2N）、「更多」展示 `more_limit`；`deep_scan=true` 时每引擎取到 `deep_scan_limit`、验证 `deep_verify_top_n`、「更多」展示 `deep_more_limit`。改取数只动这一处，别在引擎里另加截断。
+**取数分两档**：`deep_scan=true`（默认）时每引擎取到 `deep_scan_limit`、验证 `deep_verify_top_n`、「更多」展示 `deep_more_limit`；关掉后退回 `max_results` / `verify_top_n`（Lens 2N）/ `more_limit`。改取数只动这一处，别在引擎里另加截断。
 
 **比对必须用原图**：Yandex 的 `thumb` 是裁成 148×90 的方框，裁剪会把 dHash 打乱。`to_yandex_candidate()` 优先取 `originalImage.url`，没有才回退 `thumb` 并在 note 里标明。新增引擎照这个规矩来。
 

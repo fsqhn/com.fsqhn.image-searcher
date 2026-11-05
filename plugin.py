@@ -503,14 +503,15 @@ class PluginSectionConfig(PluginConfigBase):
         le=10,
     )
     deep_scan: bool = Field(
-        default=False,
+        default=True,
         description=(
             "深度检索：每个引擎不只取前几条，而是按下面的上限尽量多取，并加大指纹比对数量。"
             "能提高找出来的概率，但一次搜索会明显变慢。"
         ),
         json_schema_extra=_ui(
             "深度检索（取更多结果）",
-            "打开后每个引擎按「深度检索时每引擎上限」取数，找出来的概率更高，代价是慢一倍左右。",
+            "默认打开。每个引擎按「深度检索时每引擎上限」取数，找出来的概率更高，代价是慢一倍左右；"
+            "嫌慢可以关掉。",
         ),
     )
     deep_scan_limit: int = Field(
