@@ -5,12 +5,18 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from requests.exceptions import SSLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.engines import (  # noqa: E402
     Candidate,
+    EngineError,
     LensEngine,
+    YandexEngine,
+    is_yandex_shell_page,
     to_yandex_candidate,
     verify_candidate,
 )
@@ -230,6 +236,68 @@ class LensRetryTest(unittest.TestCase):
         with self.assertRaises(EngineError):
             self._engine(fake).search(b"img")
         self.assertEqual(len(calls), 3)
+
+
+class _FakeResponse:
+    def __init__(self, text: str, status_code: int = 200) -> None:
+        self.text = text
+        self.status_code = status_code
+
+
+class _FakeSession:
+    """fail=True 模拟代理线路 TLS 被掐断，False 返回正常页。"""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+
+    def post(self, *args, **kwargs):
+        if self.fail:
+            raise SSLError("EOF occurred in violation of protocol")
+        return _FakeResponse("<html></html>")
+
+    def close(self) -> None:
+        pass
+
+
+class YandexEngineRouteTest(unittest.TestCase):
+    """代理线路抖动时要换直连，别整条引擎失败；空壳页要如实说明。"""
+
+    def test_routes_try_proxy_then_direct(self) -> None:
+        self.assertEqual(
+            YandexEngine("http://127.0.0.1:7890")._routes(),
+            ["http://127.0.0.1:7890", ""],
+        )
+        self.assertEqual(YandexEngine("")._routes(), [""])
+
+    def test_falls_back_to_direct_when_proxy_tls_fails(self) -> None:
+        used: list[str] = []
+
+        def factory(proxy: str = ""):
+            used.append(proxy)
+            return _FakeSession(fail=bool(proxy))
+
+        site = {"url": "https://x.com/a/status/1", "title": "t"}
+        with mock.patch("core.engines.make_session", side_effect=factory), mock.patch(
+            "core.engines.parse_yandex_sites", return_value=[site]
+        ):
+            got = YandexEngine("http://127.0.0.1:7890", timeout=10).search(b"img")
+        self.assertEqual(used[0], "http://127.0.0.1:7890")
+        self.assertEqual(used[1], "")
+        self.assertEqual(len(got), 1)
+
+    def test_shell_page_is_reported_as_shell(self) -> None:
+        with mock.patch("core.engines.make_session", return_value=_FakeSession()), mock.patch(
+            "core.engines.parse_yandex_sites", return_value=None
+        ), mock.patch("core.engines.is_yandex_shell_page", return_value=True):
+            with self.assertRaises(EngineError) as ctx:
+                YandexEngine("", timeout=10).search(b"img")
+        self.assertIn("空壳页", str(ctx.exception))
+
+    def test_shell_detection(self) -> None:
+        shell = "<html><body><h1>The service is under construction.</h1></body></html>"
+        self.assertTrue(is_yandex_shell_page(shell))
+        self.assertFalse(is_yandex_shell_page("<html>" + "x" * 6000 + "under construction</html>"))
+        self.assertFalse(is_yandex_shell_page("<html><div data-state='{}'></div></html>"))
 
 
 if __name__ == "__main__":

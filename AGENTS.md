@@ -129,7 +129,7 @@ core/maibot_compat.py  能力返回值解包
 | 指令匹配用 `compiled_pattern.search(text)` | 用 `core/commands.py` 的 `build_command_pattern()`，它容忍前置/嵌套占位符 |
 | SerpAPI 的 `thumbnail` 在 gstatic，国内不可达；`image` 才是推文原图 | 验证与配图都用 `image` |
 | SerpAPI Image API 上限 500KB | `prepare_upload` 压到 480KB |
-| Yandex 国内直连返回「under construction」，走代理 + `yandex.ru` 正常 | hosts 顺序 `yandex.ru → yandex.com.tr → yandex.com`；读超时重试一次 |
+| Yandex 页面比图床更依赖线路：2026-11 实测 `yandex.ru` / `yandex.com.tr` 走代理会间歇 SSL 15 秒失败，直连反而 3 秒出结果；`yandex.com` 无论代理还是直连都只回 1.7KB「under construction」空壳页 | hosts 顺序 `yandex.ru → yandex.com.tr → yandex.com`；每条线路失败就换下一条（代理 → 直连），读超时同线路重试一次；空壳页由 `is_yandex_shell_page()` 单独识别并在错误里点名，别笼统写成「结果页结构变化」 |
 | SauceNAO 匿名 API 返回 403 | 无 key 时自动跳过；免费档 `short_limit=4`、每天 100 次 |
 | 百度 `image_src` 是 `w=889&h=500` 裁剪图 | 真实匹配常落「疑似」（距离 10~14），不要为此放宽 `hash_threshold` |
 | 部分 CDN 直接封服务器 IP（`cdn.donmai.us` 403、`lookaside.instagram.com` 返回非图片） | 只能标「未验证」放参考区 |
@@ -195,7 +195,7 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 python -m unittest discover -s tests -v
 ```
 
-目前 334 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 338 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

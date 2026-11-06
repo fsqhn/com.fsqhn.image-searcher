@@ -15,7 +15,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from requests import ReadTimeout
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ReadTimeout, SSLError
 
 from .extract import (
     X_PAGE_LABELS,
@@ -234,38 +235,75 @@ class YandexEngine:
         self.proxy = proxy
         self.timeout = timeout
 
+    def _routes(self) -> list[str]:
+        """先走配置的代理，失败再试直连（"" 表示直连）。"""
+        routes: list[str] = []
+        for route in (self.proxy, ""):
+            if route not in routes:
+                routes.append(route)
+        return routes
+
     def search(self, raw: bytes, image_url: str = "", stream_id: str = "") -> list[Candidate]:
-        last_error = ""
+        failures: list[str] = []
+        deadline = time.monotonic() + max(10.0, float(self.timeout))
         for host in YANDEX_HOSTS:
-            for attempt in (1, 2):
-                session = make_session(self.proxy)
-                try:
-                    resp = session.post(
-                        f"{host}/images/search",
-                        params={"rpt": "imageview", "cbir_page": "sites"},
-                        data={"prg": "1"},
-                        files={"upfile": ("blob", raw, "image/jpeg")},
-                        timeout=_timeout(self.timeout),
-                    )
-                    if resp.status_code != 200:
-                        last_error = f"HTTP {resp.status_code}"
+            host_name = host.split("//", 1)[-1]
+            for route in self._routes():
+                route_name = "代理" if route else "直连"
+                for attempt in (1, 2):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 3:
                         break
-                    sites = parse_yandex_sites(resp.text)
-                    if sites is None:
-                        last_error = "结果页结构变化，未找到 data-state"
+                    session = make_session(route)
+                    try:
+                        resp = session.post(
+                            f"{host}/images/search",
+                            params={"rpt": "imageview", "cbir_page": "sites"},
+                            data={"prg": "1"},
+                            files={"upfile": ("blob", raw, "image/jpeg")},
+                            timeout=_timeout(min(remaining, self.timeout)),
+                        )
+                        if resp.status_code != 200:
+                            failures.append(f"{host_name}（{route_name}）HTTP {resp.status_code}")
+                            break
+                        sites = parse_yandex_sites(resp.text)
+                        if sites is None:
+                            # yandex.com 长期返回「服务建设中」空壳页，没有内嵌 state，
+                            # 别再把它说成「结构变化」，那会误导排查方向。
+                            kind = "返回空壳页" if is_yandex_shell_page(resp.text) else "结果页结构变化"
+                            failures.append(f"{host_name}（{route_name}）{kind}")
+                            break
+                        return [to_yandex_candidate(site, self.name) for site in sites]
+                    except ReadTimeout as exc:
+                        # 跨境链路偶发抖动，同一线路重试一次通常能过
+                        failures.append(f"{host_name}（{route_name}）超时")
+                        if attempt == 1:
+                            continue
                         break
-                    return [to_yandex_candidate(site, self.name) for site in sites]
-                except ReadTimeout as exc:
-                    # 跨境链路偶发抖动，重试一次通常能过；超时参数不放大，避免拖长整条搜索
-                    last_error = f"ReadTimeout: {str(exc)[:120]}"
-                    if attempt == 1:
-                        continue
-                except Exception as exc:  # noqa: BLE001
-                    last_error = f"{type(exc).__name__}: {str(exc)[:120]}"
-                    break
-                finally:
-                    session.close()
-        raise EngineError(last_error or "Yandex 无响应")
+                    except (SSLError, RequestsConnectionError) as exc:
+                        # TLS 被掐断、连不上：换线路比原地重试有意义
+                        failures.append(f"{host_name}（{route_name}）{type(exc).__name__}")
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append(f"{host_name}（{route_name}）{type(exc).__name__}")
+                        break
+                    finally:
+                        session.close()
+        raise EngineError(_attempt_summary(failures) or "Yandex 无响应")
+
+
+def _attempt_summary(failures: list[str]) -> str:
+    """把各站点各线路的失败原因压成一句，够诊断又不刷屏。"""
+    seen: list[str] = []
+    for item in failures:
+        if item not in seen:
+            seen.append(item)
+    return "；".join(seen[:6])
+
+
+def is_yandex_shell_page(page: str) -> bool:
+    """Yandex 对部分出口返回的「服务建设中」页面，体积很小且没有 data-state。"""
+    return len(page) < 5000 and "under construction" in page.lower()
 
 
 def parse_yandex_sites(page: str) -> list[dict] | None:
