@@ -40,6 +40,21 @@ class PublicUrlTest(unittest.TestCase):
         self.assertTrue(is_public_url("https://1.1.1.1/a.jpg"))
         self.assertTrue(is_public_url("http://8.8.8.8/a.jpg"))
 
+    def test_fake_ip_rejected_by_default(self) -> None:
+        for url in ("http://198.18.0.1/a.jpg", "http://198.19.255.254/a.jpg"):
+            with self.subTest(url=url):
+                self.assertFalse(is_public_url(url))
+
+    def test_fake_ip_allowed_when_enabled(self) -> None:
+        for url in ("http://198.18.0.1/a.jpg", "http://198.19.255.254/a.jpg"):
+            with self.subTest(url=url):
+                self.assertTrue(is_public_url(url, allow_fake_ip=True))
+
+    def test_fake_ip_option_keeps_private_networks_blocked(self) -> None:
+        for url in ("http://10.0.0.8/a.jpg", "http://192.168.1.1/a.jpg", "http://127.0.0.1/a.jpg"):
+            with self.subTest(url=url):
+                self.assertFalse(is_public_url(url, allow_fake_ip=True))
+
     def test_empty_and_garbage_are_rejected(self) -> None:
         for url in ("", "not a url", "https://"):
             with self.subTest(url=url):
@@ -98,7 +113,7 @@ class DownloadRetryTest(unittest.TestCase):
         proxy = "http://127.0.0.1:6789"
         calls = []
 
-        def fake_download(url, route="", timeout=15.0):
+        def fake_download(url, route="", timeout=15.0, **_kwargs):
             calls.append(route)
             if len(calls) == 1:
                 raise HttpError("SSLError: SSLEOFError(8, 'EOF occurred in violation of protocol')")
@@ -114,7 +129,7 @@ class DownloadRetryTest(unittest.TestCase):
         """403 是图床要来源页，不是线路问题：带 Referer 再试一次。"""
         calls = []
 
-        def fake_download(url, route="", timeout=15.0, referer=""):
+        def fake_download(url, route="", timeout=15.0, referer="", **_kwargs):
             calls.append(referer)
             if not referer:
                 raise HttpError("HTTP 403")
@@ -130,7 +145,7 @@ class DownloadRetryTest(unittest.TestCase):
         """带 Referer 还是 403 就放弃，不要无休止地打对端。"""
         calls = []
 
-        def fake_download(url, route="", timeout=15.0, referer=""):
+        def fake_download(url, route="", timeout=15.0, referer="", **_kwargs):
             calls.append(referer)
             raise HttpError("HTTP 403")
 
@@ -143,7 +158,7 @@ class DownloadRetryTest(unittest.TestCase):
     def test_404_is_not_retried(self) -> None:
         calls = []
 
-        def fake_download(url, route="", timeout=15.0, referer=""):
+        def fake_download(url, route="", timeout=15.0, referer="", **_kwargs):
             calls.append(referer)
             raise HttpError("HTTP 404")
 

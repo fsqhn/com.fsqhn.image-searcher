@@ -629,6 +629,17 @@ class PluginSectionConfig(PluginConfigBase):
             placeholder="http://127.0.0.1:6789",
         ),
     )
+    allow_fake_ip: bool = Field(
+        default=False,
+        description=(
+            "放行 198.18.0.0/15（Clash / OpenClash 的 fake-ip 段）。开着 fake-ip 时，"
+            "候选图域名会被解析成这个段，默认被当成非公网地址拒绝，表现为候选图全部下载失败。"
+        ),
+        json_schema_extra=_ui(
+            "放行 fake-ip 段",
+            "用 OpenClash 等 fake-ip 模式时打开；普通网络保持关闭。只放行 198.18.0.0/15，内网地址照旧拒绝。",
+        ),
+    )
     verbose_log: bool = Field(
         default=False,
         description="开启后把取图、每个引擎的耗时与错误、候选验证过程都写进日志，排查问题时打开，平时关着。",
@@ -1294,6 +1305,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 url,
                 self._proxy(),
                 self.config.plugin.download_timeout,
+                allow_fake_ip=bool(self.config.plugin.allow_fake_ip),
             )
         except HttpError as error:
             self.ctx.logger.info("图片下载失败（两条线路都试过）：%s → %s", url[:80], error)
@@ -1760,6 +1772,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 section.hash_threshold,
                 self._proxy(),
                 section.download_timeout,
+                section.allow_fake_ip,
             )
 
         results = await asyncio.gather(

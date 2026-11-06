@@ -636,6 +636,7 @@ def verify_candidate(
     threshold: int,
     proxy: str = "",
     timeout: float = 12.0,
+    allow_fake_ip: bool = False,
 ) -> Candidate:
     """下载候选图并比对指纹，就地更新 status / distance。
 
@@ -665,11 +666,15 @@ def verify_candidate(
     from .hashing import dhash, hamming
 
     try:
-        raw = download_image_multi(candidate.image_url, proxy, timeout=timeout)
+        raw = download_image_multi(
+            candidate.image_url, proxy, timeout=timeout, allow_fake_ip=allow_fake_ip
+        )
     except HttpError as exc:
         if candidate.fallback_image:
             try:
-                raw = download_image_multi(candidate.fallback_image, proxy, timeout=timeout)
+                raw = download_image_multi(
+                    candidate.fallback_image, proxy, timeout=timeout, allow_fake_ip=allow_fake_ip
+                )
             except HttpError:
                 candidate.status = "unverified"
                 candidate.note = f"候选图下载失败：{str(exc)[:60]}"

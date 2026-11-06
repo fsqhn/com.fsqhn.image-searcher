@@ -27,17 +27,24 @@ _DIRECT_FIRST_SUFFIXES = ("yandex.net", "yandex.ru", "yandex.com", "yandex.com.t
 
 _BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "metadata", "metadata.google.internal"}
 
+# Clash / OpenClash 的 fake-ip 模式把域名解析到 198.18.0.0/15：这段本身不是公网，
+# 但请求经代理能正常到达目标站。默认仍按非公网拒绝，由用户显式放行。
+_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+
 
 class HttpError(RuntimeError):
     """网络请求失败。"""
 
 
-def is_public_url(url: str) -> bool:
+def is_public_url(url: str, *, allow_fake_ip: bool = False) -> bool:
     """只放行指向公网地址的 http(s) 链接。
 
     图片 URL 有两个来源：聊天消息里的图片段和搜索引擎返回的候选图。前者
     可以由群成员构造，所以不能直接拿去请求——否则一条伪造的图片段就能让
     进程带着用户配的代理去访问本机、内网或云厂商的元数据接口。
+
+    ``allow_fake_ip`` 打开时额外放行 198.18.0.0/15（Clash fake-ip 段），
+    其余内网地址照旧拒绝。
     """
     parsed = urlparse(url or "")
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -61,7 +68,15 @@ def is_public_url(url: str) -> bool:
                 continue
     if not addresses:
         return False
-    return all(address.is_global for address in addresses)
+    return all(
+        address.is_global
+        or (
+            allow_fake_ip
+            and isinstance(address, ipaddress.IPv4Address)
+            and address in _FAKE_IP_NET
+        )
+        for address in addresses
+    )
 
 
 
@@ -120,12 +135,20 @@ def referer_of(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}/"
 
 
-def download_image_multi(url: str, proxy: str = "", timeout: float = 15.0, attempts: int = 3) -> bytes:
+def download_image_multi(
+    url: str,
+    proxy: str = "",
+    timeout: float = 15.0,
+    attempts: int = 3,
+    *,
+    allow_fake_ip: bool = False,
+) -> bytes:
     """下载图片，失败时换线路并重试。
 
     Yandex 图床直连优先（代理反而更慢），其他站点先走代理。TLS 被中途掐断这类
     瞬时错误很常见，单次尝试经常白给，所以按线路轮换重试几次；对端明确拒绝的
-    （403/404、地址不合规）不浪费次数。
+    （403/404、地址不合规）不浪费次数。``allow_fake_ip`` 透传给地址校验，用于
+    OpenClash 这类把域名解析到 198.18.0.0/15 的 fake-ip 模式。
     """
     routes = download_routes(url, proxy)
     last_error: HttpError | None = None
@@ -133,7 +156,7 @@ def download_image_multi(url: str, proxy: str = "", timeout: float = 15.0, attem
     for index in range(total):
         route = routes[index % len(routes)]
         try:
-            return download_image(url, route, timeout)
+            return download_image(url, route, timeout, allow_fake_ip=allow_fake_ip)
         except HttpError as exc:
             last_error = exc
             if not is_transient_error(exc):
@@ -146,17 +169,26 @@ def download_image_multi(url: str, proxy: str = "", timeout: float = 15.0, attem
         origin = referer_of(url)
         if origin:
             try:
-                return download_image(url, routes[0], timeout, referer=origin)
+                return download_image(
+                    url, routes[0], timeout, referer=origin, allow_fake_ip=allow_fake_ip
+                )
             except HttpError as exc:
                 last_error = exc
     raise last_error or HttpError("图片下载失败")
 
 
-def download_image(url: str, proxy: str = "", timeout: float = 15.0, referer: str = "") -> bytes:
+def download_image(
+    url: str,
+    proxy: str = "",
+    timeout: float = 15.0,
+    referer: str = "",
+    *,
+    allow_fake_ip: bool = False,
+) -> bytes:
     """下载候选图，返回原始字节；超过大小上限直接放弃。"""
     if not url:
         raise HttpError("图片地址为空")
-    if not is_public_url(url):
+    if not is_public_url(url, allow_fake_ip=allow_fake_ip):
         raise HttpError("图片地址不是公网 http(s)，已拒绝")
     session = make_session(proxy, headers={"Referer": referer})
     try:
