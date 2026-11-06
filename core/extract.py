@@ -452,6 +452,21 @@ def is_crawler_placeholder(url: str) -> bool:
     return "/seo/google_widget/crawler" in raw or "/lookaside/crawler" in raw
 
 
+_AVATAR_HINTS = ("avatar", "logo", "favicon")
+
+
+def is_avatar_image(url: str = "") -> bool:
+    """图片地址看着像站点头像/标志，而不是帖子里的原图。
+
+    Lens 会把页面里的用户头像、站点图标当结果图返回。头像跟原图指纹一致说明
+    「这张图被这个账号拿去当头像了」，但点进页面往往看不到它，不能当原帖出处。
+    """
+    path = urlparse(url or "").path.lower()
+    if not path:
+        return False
+    return any(hint in path for hint in _AVATAR_HINTS)
+
+
 def rescue_image_url(page_url: str, image_url: str) -> str:
     """把占位图地址换成能直接下的真图地址，换不了返回空串。
 

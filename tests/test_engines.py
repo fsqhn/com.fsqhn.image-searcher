@@ -132,15 +132,37 @@ class XPageKindTest(unittest.TestCase):
         Image.new("RGB", (32, 32), (200, 120, 60)).save(buffer, format="PNG")
         return buffer.getvalue()
 
-    def _verify(self, url: str):
+    def _verify(
+        self,
+        url: str,
+        image_url: str = "https://cdn.example.com/a.jpg",
+        name: str = "",
+        handle: str = "",
+    ):
         from unittest.mock import patch
 
         from core.hashing import dhash
 
         raw = self._png()
-        candidate = Candidate(engine="lens", url=url, image_url="https://cdn.example.com/a.jpg")
+        candidate = Candidate(
+            engine="lens", url=url, image_url=image_url, name=name, handle=handle
+        )
         with patch("core.engines.download_image_multi", return_value=raw):
             return verify_candidate(candidate, dhash(raw), 8, "", 5)
+
+    def test_avatar_image_is_not_the_original_post(self) -> None:
+        """s-20261106-1543 的实况：Lens 把 40×40 站点头像当原图，点开看不到图。"""
+        result = self._verify(
+            "https://dzmm.ai/user/following",
+            image_url="https://pxlorbit.example.com/avatar/ab/12/cd.png",
+            name="DZMM AI - 让幻想有回应",
+            handle="@dzmm",
+        )
+        self.assertEqual(result.status, "suspect")
+        self.assertIn("站点账号头像", result.note)
+        self.assertIn("指纹距离 0", result.note)
+        self.assertEqual(result.name, "")
+        self.assertEqual(result.handle, "")
 
     def test_replies_page_is_not_the_original_post(self) -> None:
         """s-20261105-1423 的实况：把 AlbertGreen69 的回复列表页当成原帖主。"""

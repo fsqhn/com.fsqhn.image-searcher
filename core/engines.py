@@ -22,6 +22,7 @@ from .extract import (
     X_PAGE_LABELS,
     clean_url,
     extract_identity,
+    is_avatar_image,
     is_crawler_placeholder,
     platform_of,
     promote_mirror,
@@ -739,6 +740,13 @@ def verify_candidate(
         label = X_PAGE_LABELS.get(page_kind, "页面")
         candidate.status = "suspect"
         candidate.note = f"指纹一致（距离 {distance}），但这是 X 的{label}，不是哪条帖子"
+    elif distance <= threshold and is_avatar_image(candidate.image_url):
+        # 头像对上只说明「这张图被这个账号拿去当头像」：页面本身往往不显示它，
+        # 点进去看不到图，也不能当原帖出处。名字多半是站点标题，一并清掉。
+        candidate.status = "suspect"
+        candidate.note = f"该图是站点账号头像（指纹距离 {distance}），不是帖子原图"
+        candidate.name = ""
+        candidate.handle = ""
     elif distance <= threshold:
         candidate.status = "match"
         candidate.note = f"指纹一致（距离 {distance}）"

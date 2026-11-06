@@ -14,6 +14,7 @@ from core.extract import (  # noqa: E402
     canonical_account_url,
     dedupe_accounts,
     extract_identity,
+    is_avatar_image,
     is_pixiv_platform,
     is_social_platform,
     is_x_platform,
@@ -313,6 +314,28 @@ class SocialPlatformTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AvatarImageTest(unittest.TestCase):
+    """Lens 会把站点账号头像当结果图返回，这种命中不算原帖。"""
+
+    def test_avatar_path_is_detected(self) -> None:
+        self.assertTrue(is_avatar_image("https://pxlorbit.example.com/avatar/ab/12/cd.png"))
+
+    def test_uploaded_avatar_path_is_detected(self) -> None:
+        self.assertTrue(is_avatar_image("https://cdn.example.com/uploads/avatars/u123.jpg"))
+
+    def test_logo_and_favicon_are_detected(self) -> None:
+        self.assertTrue(is_avatar_image("https://site.example.com/static/logo-256.png"))
+        self.assertTrue(is_avatar_image("https://site.example.com/favicon.ico"))
+
+    def test_normal_image_url_is_not_avatar(self) -> None:
+        self.assertFalse(is_avatar_image("https://cdn.example.com/photos/2026/miku-01.jpg"))
+        self.assertFalse(is_avatar_image("https://hentaiera.com/gallery/1741778/cover.jpg"))
+
+    def test_empty_and_pathless_url_are_not_avatar(self) -> None:
+        self.assertFalse(is_avatar_image(""))
+        self.assertFalse(is_avatar_image("https://example.com"))
+
 
 class CrawlerPlaceholderTest(unittest.TestCase):
     """Instagram / Facebook 的爬虫占位图：取回来是登录页 HTML，不是图。"""

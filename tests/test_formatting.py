@@ -643,6 +643,35 @@ class SplitForwardsTest(unittest.TestCase):
         self.assertIn("指纹距离 24～31", tail)
         self.assertNotIn("疑似同图", tail)
 
+    def test_avatar_hits_are_not_counted_as_same_character(self) -> None:
+        """头像命中不算「同角色或同款服装」，要单独说清点开看不到图。"""
+        avatar = Candidate(
+            engine="lens",
+            url="https://dzmm.ai/user/following",
+            distance=0,
+            status="suspect",
+        )
+        avatar.finalize()
+        avatar.note = "该图是站点账号头像（指纹距离 0），不是帖子原图"
+        other = Candidate(engine="yandex", url="https://example.com/a", distance=26, status="suspect")
+        other.finalize()
+        outcome = SearchOutcome(
+            status="not_found",
+            candidates=[avatar, other],
+            total_candidates=2,
+        )
+        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        tail = "\n".join(
+            part["content"]
+            for node in blocks[-1]
+            for part in node.get("content") or []
+            if part["type"] == "text"
+        )
+        self.assertIn("另有 1 条是站点账号头像", tail)
+        self.assertIn("指纹对上了，但那是头像不是原帖", tail)
+        self.assertIn("另有 1 条是同角色或同款服装的图", tail)
+        self.assertNotIn("另有 2 条", tail)
+
     def test_three_messages_fit_in_one_forward(self) -> None:
         """三条合起来只有两张图，能塞进同一条合并转发（NapCat 单条约 6 张）。"""
         blocks = build_result_forwards(_task(self._make_outcome()), command="盆地找鸡")

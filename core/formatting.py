@@ -260,7 +260,13 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         suspects = [
             item
             for item in outcome.candidates
-            if item.status == "suspect" and not (item.note or "").startswith("视觉复核")
+            if item.status == "suspect"
+            and not (item.note or "").startswith(("视觉复核", "该图是站点账号头像"))
+        ]
+        avatars = [
+            item
+            for item in outcome.candidates
+            if item.status == "suspect" and (item.note or "").startswith("该图是站点账号头像")
         ]
         lines = ["⚠️ 未找到可靠出处"]
         if compared:
@@ -290,6 +296,12 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
                 lines.append(f"Grok 找人没做成：{grok['error']}")
             else:
                 lines.append("Grok 在 X 上搜过，没有找到对应的账号或帖子。")
+        if avatars:
+            sites = "、".join(dict.fromkeys(item.platform for item in avatars if item.platform))
+            where = f"（{sites}）" if sites else ""
+            lines.append(
+                f"另有 {len(avatars)} 条是站点账号头像{where}：指纹对上了，但那是头像不是原帖，点开页面通常看不到这张图。"
+            )
         if suspects:
             # 「疑似同图」会把 20 多距离的照骗说成同一张：实际多是同角色、同款服装
             # 的另一个人，写清楚免得以为快找到了。
