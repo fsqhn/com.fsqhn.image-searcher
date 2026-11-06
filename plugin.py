@@ -45,7 +45,7 @@ from .core.extract import (
     x_title_name,
 )
 from .core.hashing import dhash, hamming, prepare_upload
-from .core.httpclient import HttpError, download_image_multi, make_session
+from .core.httpclient import HttpError, download_image_multi, fake_ip_networks, make_session
 from .core.keypool import KeyPool
 from .core.maibot_compat import unwrap_capability
 from .core.tasks import SearchOutcome, SearchTask, TaskStore
@@ -632,12 +632,27 @@ class PluginSectionConfig(PluginConfigBase):
     allow_fake_ip: bool = Field(
         default=False,
         description=(
-            "放行 198.18.0.0/15（Clash / OpenClash 的 fake-ip 段）。开着 fake-ip 时，"
-            "候选图域名会被解析成这个段，默认被当成非公网地址拒绝，表现为候选图全部下载失败。"
+            "放行 fake-ip 的假地址段（Clash / mihomo 默认 198.18.0.0/15）。"
+            "开着 fake-ip 时，候选图域名会被解析成这个段，默认被当成非公网地址拒绝，"
+            "表现为候选图全部下载失败。具体放行哪些段由下面的 fake_ip_ranges 决定。"
         ),
         json_schema_extra=_ui(
             "放行 fake-ip 段",
-            "用 OpenClash 等 fake-ip 模式时打开；普通网络保持关闭。只放行 198.18.0.0/15，内网地址照旧拒绝。",
+            "用 OpenClash 等 fake-ip 模式时打开；普通网络保持关闭。只放行下面列出的段，其余内网地址照旧拒绝。",
+        ),
+    )
+    fake_ip_ranges: list[str] = Field(
+        default_factory=lambda: ["198.18.0.0/15"],
+        description=(
+            "fake-ip 实际使用的网段，仅在「放行 fake-ip 段」打开时生效。"
+            "填你的 Clash / mihomo / sing-box 配置里的 fake-ip-range：mihomo 默认 198.18.0.1/16、"
+            "sing-box 默认 198.18.0.0/15；改成过别的段（例如 100.64.0.0/10）就照它填。"
+            "写错的条目会被跳过，不会变成全部放行。"
+        ),
+        json_schema_extra=_ui(
+            "fake-ip 网段",
+            "只在打开上一项后生效。默认 198.18.0.0/15；你的内核改了 fake-ip-range 就填改后的段，例如 100.64.0.0/10。",
+            placeholder="198.18.0.0/15",
         ),
     )
     verbose_log: bool = Field(
@@ -1074,6 +1089,11 @@ class ImageSearcherPlugin(MaiBotPlugin):
         """引擎、候选图下载、AI 检测共用的那一个代理。"""
         return _proxy_of(self.config.plugin.proxy)
 
+    def _fake_ip_nets(self) -> tuple:
+        """按配置解析出 fake-ip 放行网段；开关关着就是空元组。"""
+        section = self.config.plugin
+        return fake_ip_networks(section.allow_fake_ip, section.fake_ip_ranges)
+
     # -- 取图 -------------------------------------------------------------
 
     @HookHandler(
@@ -1305,7 +1325,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 url,
                 self._proxy(),
                 self.config.plugin.download_timeout,
-                allow_fake_ip=bool(self.config.plugin.allow_fake_ip),
+                allow_nets=self._fake_ip_nets(),
             )
         except HttpError as error:
             self.ctx.logger.info("图片下载失败（两条线路都试过）：%s → %s", url[:80], error)
@@ -1772,7 +1792,7 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 section.hash_threshold,
                 self._proxy(),
                 section.download_timeout,
-                section.allow_fake_ip,
+                self._fake_ip_nets(),
             )
 
         results = await asyncio.gather(

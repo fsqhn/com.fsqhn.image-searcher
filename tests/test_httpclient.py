@@ -10,7 +10,15 @@ from PIL import Image
 
 from core import httpclient
 from core.hashing import dhash, prepare_upload
-from core.httpclient import HttpError, download_image_multi, download_routes, is_public_url, is_transient_error
+from core.httpclient import (
+    DEFAULT_FAKE_IP_RANGES,
+    HttpError,
+    download_image_multi,
+    download_routes,
+    fake_ip_networks,
+    is_public_url,
+    is_transient_error,
+)
 
 
 class PublicUrlTest(unittest.TestCase):
@@ -46,14 +54,30 @@ class PublicUrlTest(unittest.TestCase):
                 self.assertFalse(is_public_url(url))
 
     def test_fake_ip_allowed_when_enabled(self) -> None:
+        nets = fake_ip_networks(True)
         for url in ("http://198.18.0.1/a.jpg", "http://198.19.255.254/a.jpg"):
             with self.subTest(url=url):
-                self.assertTrue(is_public_url(url, allow_fake_ip=True))
+                self.assertTrue(is_public_url(url, allow_nets=nets))
+
+    def test_custom_fake_ip_range_is_honoured(self) -> None:
+        nets = fake_ip_networks(True, ["100.64.0.0/10"])
+        self.assertTrue(is_public_url("http://100.64.1.2/a.jpg", allow_nets=nets))
+        self.assertFalse(is_public_url("http://198.18.0.1/a.jpg", allow_nets=nets))
+
+    def test_invalid_range_is_skipped(self) -> None:
+        nets = fake_ip_networks(True, ["不是网段", "", "198.18.0.0/15"])
+        self.assertEqual([str(net) for net in nets], ["198.18.0.0/15"])
+        self.assertTrue(is_public_url("http://198.18.0.1/a.jpg", allow_nets=nets))
+        self.assertFalse(is_public_url("http://10.0.0.8/a.jpg", allow_nets=nets))
+
+    def test_switch_off_ignores_ranges(self) -> None:
+        self.assertEqual(fake_ip_networks(False, DEFAULT_FAKE_IP_RANGES), ())
 
     def test_fake_ip_option_keeps_private_networks_blocked(self) -> None:
+        nets = fake_ip_networks(True)
         for url in ("http://10.0.0.8/a.jpg", "http://192.168.1.1/a.jpg", "http://127.0.0.1/a.jpg"):
             with self.subTest(url=url):
-                self.assertFalse(is_public_url(url, allow_fake_ip=True))
+                self.assertFalse(is_public_url(url, allow_nets=nets))
 
     def test_empty_and_garbage_are_rejected(self) -> None:
         for url in ("", "not a url", "https://"):

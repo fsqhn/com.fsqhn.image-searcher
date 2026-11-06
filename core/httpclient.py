@@ -27,24 +27,50 @@ _DIRECT_FIRST_SUFFIXES = ("yandex.net", "yandex.ru", "yandex.com", "yandex.com.t
 
 _BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "metadata", "metadata.google.internal"}
 
-# Clash / OpenClash 的 fake-ip 模式把域名解析到 198.18.0.0/15：这段本身不是公网，
-# 但请求经代理能正常到达目标站。默认仍按非公网拒绝，由用户显式放行。
-_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+# fake-ip 模式把域名解析成一段假地址：Clash / mihomo 默认 fake-ip-range 198.18.0.1/16
+# （实际覆盖 198.18~198.19），sing-box 默认 198.18.0.0/15。这段本身不是公网，但请求
+# 经代理能正常到达目标站，所以留给用户显式放行。内核或自定义配置可以把这段改成别处，
+# 所以范围做成可配的，下面只是默认值。
+DEFAULT_FAKE_IP_RANGES = ("198.18.0.0/15",)
+
+
+def fake_ip_networks(enabled: bool, ranges: object = None) -> tuple[ipaddress._BaseNetwork, ...]:
+    """把开关与网段列表解析成放行清单；关着则返回空元组。
+
+    单个条目写错只跳过它自己，不会退回「全部放行」——配置写错的结果是少放行，
+    不是把 SSRF 防护关掉。
+    """
+    if not enabled:
+        return ()
+    raw = ranges if ranges else DEFAULT_FAKE_IP_RANGES
+    if isinstance(raw, str):
+        raw = [raw]
+    networks: list[ipaddress._BaseNetwork] = []
+    for item in raw:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(text, strict=False))
+        except ValueError:
+            continue
+    return tuple(networks)
+
 
 
 class HttpError(RuntimeError):
     """网络请求失败。"""
 
 
-def is_public_url(url: str, *, allow_fake_ip: bool = False) -> bool:
+def is_public_url(url: str, *, allow_nets: tuple[ipaddress._BaseNetwork, ...] = ()) -> bool:
     """只放行指向公网地址的 http(s) 链接。
 
     图片 URL 有两个来源：聊天消息里的图片段和搜索引擎返回的候选图。前者
     可以由群成员构造，所以不能直接拿去请求——否则一条伪造的图片段就能让
     进程带着用户配的代理去访问本机、内网或云厂商的元数据接口。
 
-    ``allow_fake_ip`` 打开时额外放行 198.18.0.0/15（Clash fake-ip 段），
-    其余内网地址照旧拒绝。
+    ``allow_nets`` 是额外放行的网段（由 ``fake_ip_networks()`` 从配置解析），
+    只用于 fake-ip 这类假地址；未列出的内网地址照旧拒绝。
     """
     parsed = urlparse(url or "")
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -70,10 +96,9 @@ def is_public_url(url: str, *, allow_fake_ip: bool = False) -> bool:
         return False
     return all(
         address.is_global
-        or (
-            allow_fake_ip
-            and isinstance(address, ipaddress.IPv4Address)
-            and address in _FAKE_IP_NET
+        or any(
+            address.version == network.version and address in network
+            for network in allow_nets
         )
         for address in addresses
     )
@@ -141,14 +166,14 @@ def download_image_multi(
     timeout: float = 15.0,
     attempts: int = 3,
     *,
-    allow_fake_ip: bool = False,
+    allow_nets: tuple[ipaddress._BaseNetwork, ...] = (),
 ) -> bytes:
     """下载图片，失败时换线路并重试。
 
     Yandex 图床直连优先（代理反而更慢），其他站点先走代理。TLS 被中途掐断这类
     瞬时错误很常见，单次尝试经常白给，所以按线路轮换重试几次；对端明确拒绝的
-    （403/404、地址不合规）不浪费次数。``allow_fake_ip`` 透传给地址校验，用于
-    OpenClash 这类把域名解析到 198.18.0.0/15 的 fake-ip 模式。
+    （403/404、地址不合规）不浪费次数。``allow_nets`` 透传给地址校验，用于 fake-ip
+    这类把域名解析成假地址、但请求经代理能到达的场景。
     """
     routes = download_routes(url, proxy)
     last_error: HttpError | None = None
@@ -156,7 +181,7 @@ def download_image_multi(
     for index in range(total):
         route = routes[index % len(routes)]
         try:
-            return download_image(url, route, timeout, allow_fake_ip=allow_fake_ip)
+            return download_image(url, route, timeout, allow_nets=allow_nets)
         except HttpError as exc:
             last_error = exc
             if not is_transient_error(exc):
@@ -170,7 +195,7 @@ def download_image_multi(
         if origin:
             try:
                 return download_image(
-                    url, routes[0], timeout, referer=origin, allow_fake_ip=allow_fake_ip
+                    url, routes[0], timeout, referer=origin, allow_nets=allow_nets
                 )
             except HttpError as exc:
                 last_error = exc
@@ -183,12 +208,12 @@ def download_image(
     timeout: float = 15.0,
     referer: str = "",
     *,
-    allow_fake_ip: bool = False,
+    allow_nets: tuple[ipaddress._BaseNetwork, ...] = (),
 ) -> bytes:
     """下载候选图，返回原始字节；超过大小上限直接放弃。"""
     if not url:
         raise HttpError("图片地址为空")
-    if not is_public_url(url, allow_fake_ip=allow_fake_ip):
+    if not is_public_url(url, allow_nets=allow_nets):
         raise HttpError("图片地址不是公网 http(s)，已拒绝")
     session = make_session(proxy, headers={"Referer": referer})
     try:

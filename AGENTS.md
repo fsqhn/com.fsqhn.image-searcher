@@ -183,7 +183,7 @@ core/maibot_compat.py  能力返回值解包
 
 只有一个代理设置：`[plugin] proxy`，引擎、候选图下载、AI 检测全走它。写 `direct` / `none` / `off` 表示强制直连，留空等同直连。已去掉引擎段里的 proxy 与 `image_proxy`，不要再加回来。
 
-SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒绝。**fake-ip 例外**：OpenClash 这类 fake-ip 模式会把域名解析到 `198.18.0.0/15`，被当成非公网，于是所有候选图都报「图片地址不是公网 http(s)」。`[plugin] allow_fake_ip` 默认 `false`，为 `true` 时只放行 `_FAKE_IP_NET = 198.18.0.0/15` 这一段，`10/172.16/192.168/127/169.254` 与云厂商元数据地址照旧拒绝。新增下载入口必须把 `allow_fake_ip` 透传下去（`is_public_url` / `download_image` / `download_image_multi` / `engines.verify_candidate`），否则开关会失效一半。
+SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒绝。**fake-ip 例外**：Clash / mihomo 默认把域名解析到 `198.18.0.0/15`，被当成非公网，于是候选图全报「图片地址不是公网 http(s)」。开关是 `[plugin] allow_fake_ip`（默认 `false`），放行范围是 `[plugin] fake_ip_ranges`（默认 `["198.18.0.0/15"]`），两者经 `fake_ip_networks()` 解析成网段元组后传下去——关着返回空元组；单个条目写错只跳过它自己，不会退化成全部放行。内核换了 `fake-ip-range`（如 `100.64.0.0/10`、IPv6 `fc00::/18`）时改这个列表即可，`10/172.16/192.168/127/169.254` 与元数据地址在未显式列出时照旧拒绝。新增下载入口必须把 `allow_nets` 透传下去（`is_public_url` / `download_image` / `download_image_multi` / `engines.verify_candidate` / `plugin._download` / `plugin._fake_ip_nets()`），否则开关会失效一半。
 
 四个引擎是顶层配置段 `[lens]` / `[yandex]` / `[baidu]` / `[saucenao]`，与 `[vision]` / `[grok]` / `[ai_detect]` 平级。**不要**改回 `[engines.lens]` 这种二阶嵌套：SDK 只把顶层配置拆成独立区块，二阶嵌套在 WebUI 里会渲染成 `[object Object]`。
 
@@ -195,7 +195,7 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 python -m unittest discover -s tests -v
 ```
 
-目前 331 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 334 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

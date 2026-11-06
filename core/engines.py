@@ -636,7 +636,7 @@ def verify_candidate(
     threshold: int,
     proxy: str = "",
     timeout: float = 12.0,
-    allow_fake_ip: bool = False,
+    allow_nets: tuple = (),
 ) -> Candidate:
     """下载候选图并比对指纹，就地更新 status / distance。
 
@@ -644,6 +644,8 @@ def verify_candidate(
     - threshold < 距离 ≤ threshold + 6：suspect（可能是裁剪或拼图）
     - 其余：mismatch
     - 下载失败或没有图片地址：保持 unverified
+
+    ``allow_nets`` 是额外放行的地址段（fake-ip 场景），原样透传给下载层。
     """
     if candidate.status in {"match", "suspect"} and candidate.similarity is not None:
         return candidate
@@ -667,13 +669,13 @@ def verify_candidate(
 
     try:
         raw = download_image_multi(
-            candidate.image_url, proxy, timeout=timeout, allow_fake_ip=allow_fake_ip
+            candidate.image_url, proxy, timeout=timeout, allow_nets=allow_nets
         )
     except HttpError as exc:
         if candidate.fallback_image:
             try:
                 raw = download_image_multi(
-                    candidate.fallback_image, proxy, timeout=timeout, allow_fake_ip=allow_fake_ip
+                    candidate.fallback_image, proxy, timeout=timeout, allow_nets=allow_nets
                 )
             except HttpError:
                 candidate.status = "unverified"
