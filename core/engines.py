@@ -19,6 +19,7 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout, SSLError
 
 from .extract import (
+    AVATAR_NOTE,
     X_PAGE_LABELS,
     clean_url,
     extract_identity,
@@ -74,6 +75,9 @@ class Candidate:
     platform: str = ""
     name: str = ""
     handle: str = ""
+    # 命中的是站点账号头像/图标，不是帖子原图。单独立字段：视觉复核对同一个候选
+    # 降级时会改写 note，靠 note 前缀认头像会漏，挑参考图就会挑到 40×40 的头像。
+    avatar: bool = False
 
     def finalize(self) -> "Candidate":
         """补全平台与身份字段。"""
@@ -89,6 +93,14 @@ class Candidate:
     @property
     def rank(self) -> int:
         return relevance_rank(self.url, self.source)
+
+
+def is_avatar_hit(item: Candidate) -> bool:
+    """这条命中是不是「站点账号头像」。
+
+    新版记录看 `avatar` 字段；旧摘要没有这个字段，退回 note 前缀判断。
+    """
+    return bool(getattr(item, "avatar", False)) or (item.note or "").startswith(AVATAR_NOTE)
 
 
 def _timeout(seconds: float) -> tuple[float, float]:
@@ -669,6 +681,25 @@ def detect_ai(
 # ---------------------------------------------------------------------------
 
 
+def reference_candidates(
+    best: Candidate | None, ordered: list[Candidate]
+) -> list[Candidate]:
+    """挑参考图时的候选顺序。
+
+    没有 best 时按距离从近到远排，并跳过头像命中：那是账号头像，距离常常是 0，
+    拿来当参考图会写成「距离 0，不是同一张」这种自相矛盾的话，页面里还看不到它。
+    """
+    if best is not None:
+        return [best, *ordered]
+    return sorted(
+        (item for item in ordered if not is_avatar_hit(item)),
+        key=lambda item: (
+            item.distance is None,
+            item.distance if item.distance is not None else 999,
+        ),
+    )
+
+
 def verify_candidate(
     candidate: Candidate,
     target_hash: int | None,
@@ -744,7 +775,8 @@ def verify_candidate(
         # 头像对上只说明「这张图被这个账号拿去当头像」：页面本身往往不显示它，
         # 点进去看不到图，也不能当原帖出处。名字多半是站点标题，一并清掉。
         candidate.status = "suspect"
-        candidate.note = f"该图是站点账号头像（指纹距离 {distance}），不是帖子原图"
+        candidate.avatar = True
+        candidate.note = f"{AVATAR_NOTE}（指纹距离 {distance}），不是帖子原图"
         candidate.name = ""
         candidate.handle = ""
     elif distance <= threshold:

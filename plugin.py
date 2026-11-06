@@ -32,6 +32,8 @@ from .core.engines import (
     SauceNaoEngine,
     YandexEngine,
     detect_ai,
+    is_avatar_hit,
+    reference_candidates,
     verify_candidate,
 )
 from .core.extract import (
@@ -1342,18 +1344,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         best 为空（没找到可靠出处）时照样给一张参考图，方便用户核对是不是同一张；
         候选全失败时退回用户原图；没有原图（比如重放磁盘恢复的任务）就返回空。
         """
-        if best is not None:
-            pool = [best, *ordered]
-        else:
-            # 没找到可靠出处时，配图要取候选里跟原图最接近的那张，不能按引擎顺序
-            # 拿第一条——那样「参考图」看起来就像随手抓的，跟相似度没关系。
-            pool = sorted(
-                ordered,
-                key=lambda item: (
-                    item.distance is None,
-                    item.distance if item.distance is not None else 999,
-                ),
-            )
+        # 没找到可靠出处时，配图取候选里跟原图最接近的那张（跳过头像命中），
+        # 不能按引擎顺序拿第一条——那样「参考图」看起来就像随手抓的。
+        pool = reference_candidates(best, ordered)
         urls: list[str] = []
         for item in pool:
             if item is None:
@@ -2041,6 +2034,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
         info["reason"] = vision.reason_of(text)
         for number in vision.parse_picks(text, len(images)):
             candidate = used[number - 1]
+            if is_avatar_hit(candidate):
+                # 头像是账号头像，跟原帖没关系：视觉说「同一个人」也确认不了什么，
+                # 保持头像说明，也不并进视觉降级的统计。
+                continue
             distance = candidate.distance
             gap = (
                 f"指纹距离 {distance}，超过阈值 {self.config.plugin.hash_threshold}"

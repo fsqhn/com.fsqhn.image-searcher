@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from .engines import Candidate
-from .extract import is_forum_page
+from .engines import Candidate, is_avatar_hit
+from .extract import is_avatar_image, is_forum_page
 from .tasks import SearchOutcome, SearchTask
 
 AI_FLAG_THRESHOLD = 0.75
@@ -199,6 +199,8 @@ def _vision_pick_line(outcome: SearchOutcome) -> str:
         for item in outcome.candidates
         if item.status == "suspect"
         and (item.note or "").startswith("视觉复核")
+        and not is_avatar_hit(item)
+        and not is_avatar_image(item.image_url)
         and item.url
     ]
     if not picks:
@@ -261,12 +263,13 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
             item
             for item in outcome.candidates
             if item.status == "suspect"
-            and not (item.note or "").startswith(("视觉复核", "该图是站点账号头像"))
+            and not is_avatar_hit(item)
+            and not (item.note or "").startswith("视觉复核")
         ]
         avatars = [
             item
             for item in outcome.candidates
-            if item.status == "suspect" and (item.note or "").startswith("该图是站点账号头像")
+            if item.status == "suspect" and is_avatar_hit(item)
         ]
         lines = ["⚠️ 未找到可靠出处"]
         if compared:
@@ -465,19 +468,40 @@ def reference_kind(outcome: SearchOutcome, source: str) -> str:
     return "candidate"
 
 
+def _distance_phrase(distance: int | None) -> str:
+    """把距离写成一句话：0 就是同一张，不能说成「不是同一张」。"""
+    if distance is None:
+        return "未经指纹确认"
+    if distance == 0:
+        return "跟原图是同一张（指纹距离 0）"
+    return f"指纹距离 {distance}，不是同一张"
+
+
+def _is_avatar_source(outcome: SearchOutcome, source: str) -> bool:
+    """参考图是不是某条头像命中——这种图跟原帖无关，说法要单独写。"""
+    if is_avatar_image(source):
+        return True
+    return any(
+        item.image_url and item.image_url == source and is_avatar_hit(item)
+        for item in outcome.candidates
+    )
+
+
 def _reference_hint(outcome: SearchOutcome, source: str) -> str:
     """参考图的标题：点明来源，并标出跟原图的指纹距离。"""
     distance = _reference_distance(outcome, source)
-    gap = f"指纹距离 {distance}" if distance is not None else "未经指纹确认"
+    gap = _distance_phrase(distance)
     kind = reference_kind(outcome, source)
     if kind == "upload":
-        return "📋 参考图（候选图都没取到，这张是你发的原图，没有可对照的候选）"
+        return "📋 参考图（没有可用的候选图，这张是你发的原图，没得对照）"
+    if _is_avatar_source(outcome, source):
+        return f"📋 参考图（这张是站点账号头像，{gap}，页面里看不到它，也不是原帖）"
     if kind == "grok":
-        return f"📋 参考图（Grok 帖子配图里跟原图最接近的一张，{gap}，不是同一张）"
+        return f"📋 参考图（Grok 帖子配图里跟原图最接近的一张，{gap}）"
     if kind == "vision":
-        return f"📋 参考图（视觉方案挑中的那张，{gap}，不是同一张）"
+        return f"📋 参考图（视觉方案挑中的那张，{gap}）"
     return (
-        f"📋 参考图（引擎候选里跟原图最接近的一张，{gap}，不是同一张；"
+        f"📋 参考图（引擎候选里跟原图最接近的一张，{gap}；"
         "不是视觉方案挑的，也不是 Grok 给的）"
     )
 
@@ -488,17 +512,18 @@ def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay
         # 说清这是复用，不是刚跑出来的：同一张图结果一样，但引擎这次一条都没调。
         lines.append("💾 这张图之前搜过，直接复用了当时的结果（引擎没有重新跑）")
     if outcome.image_b64 and outcome.image_source == "upload":
-        lines.append("（候选图都没取到，转发里的图是你发的原图）")
+        lines.append("（没有可用的候选图，转发里的图是你发的原图）")
     elif outcome.image_b64 and outcome.best is None:
-        distance = _reference_distance(outcome, outcome.image_source)
-        suffix = f"，指纹距离 {distance}，不是同一张" if distance is not None else "，未经指纹确认"
+        phrase = _distance_phrase(_reference_distance(outcome, outcome.image_source))
         kind = reference_kind(outcome, outcome.image_source)
-        if kind == "grok":
-            lines.append(f"（参考图是 Grok 给的帖子里跟原图最接近的一张{suffix}）")
+        if _is_avatar_source(outcome, outcome.image_source):
+            lines.append(f"（参考图是站点账号头像，{phrase}，页面里看不到它）")
+        elif kind == "grok":
+            lines.append(f"（参考图是 Grok 给的帖子里跟原图最接近的一张，{phrase}）")
         elif kind == "vision":
-            lines.append(f"（参考图是视觉方案挑中的那张{suffix}）")
+            lines.append(f"（参考图是视觉方案挑中的那张，{phrase}）")
         else:
-            lines.append(f"（参考区那张是候选里跟原图最接近的一张{suffix}）")
+            lines.append(f"（参考区那张是候选里跟原图最接近的一张，{phrase}）")
     if outcome.errors:
         failed = "、".join(f"{name}（{message[:40]}）" for name, message in outcome.errors.items())
         lines.append(f"⚠️ 未返回结果的引擎：{failed}")

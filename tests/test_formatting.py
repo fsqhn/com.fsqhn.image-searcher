@@ -423,6 +423,52 @@ class GrokReferenceTest(unittest.TestCase):
         self.assertIn("候选里跟原图最接近的一张", blob)
         self.assertIn("指纹距离 22", blob)
 
+    def test_reference_at_distance_zero_is_not_called_different(self) -> None:
+        """距离 0 就是同一张，不能写成「不是同一张」。"""
+        item = Candidate(
+            engine="lens",
+            url="https://x.com/someone",
+            image_url="https://img/a.jpg",
+            distance=0,
+            status="suspect",
+            note="指纹一致（距离 0），但这是 X 的账号主页，不是哪条帖子",
+        )
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[item],
+            image_b64="AAAA",
+            image_source="https://img/a.jpg",
+            total_candidates=1,
+        )
+        blob = json.dumps(build_forward_nodes(_task(outcome), command="盆地找鸡"), ensure_ascii=False)
+        self.assertIn("指纹距离 0", blob)
+        self.assertNotIn("不是同一张", blob)
+
+    def test_avatar_reference_is_labelled_as_avatar(self) -> None:
+        """参考图本身是头像命中时，要写清是账号头像，而不是「最接近的一张」。"""
+        item = Candidate(
+            engine="lens",
+            url="https://dzmm.ai/user/x/following",
+            image_url="https://pxlorbit.com/avatar/a.png",
+            distance=0,
+            status="suspect",
+            avatar=True,
+        )
+        item.note = "视觉复核：疑似同一个人，但那是dzmm.ai上的页面、不是作者主页（指纹距离 0）"
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[item],
+            image_b64="AAAA",
+            image_source="https://pxlorbit.com/avatar/a.png",
+            total_candidates=1,
+        )
+        blob = json.dumps(build_forward_nodes(_task(outcome), command="盆地找鸡"), ensure_ascii=False)
+        self.assertIn("这张是站点账号头像", blob)
+        self.assertIn("页面里看不到它", blob)
+        self.assertNotIn("不是同一张", blob)
+
     def test_reference_image_from_vision_is_labelled(self) -> None:
         """参考图是视觉方案挑的那张时，标题要写明，别让人以为是引擎直接搜到的。"""
         item = Candidate(
@@ -644,15 +690,17 @@ class SplitForwardsTest(unittest.TestCase):
         self.assertNotIn("疑似同图", tail)
 
     def test_avatar_hits_are_not_counted_as_same_character(self) -> None:
-        """头像命中不算「同角色或同款服装」，要单独说清点开看不到图。"""
+        """头像命中不算「同角色或同款服装」，note 被视觉改写后也要认出来。"""
         avatar = Candidate(
             engine="lens",
             url="https://dzmm.ai/user/following",
             distance=0,
             status="suspect",
+            avatar=True,
         )
         avatar.finalize()
-        avatar.note = "该图是站点账号头像（指纹距离 0），不是帖子原图"
+        # 视觉降级会覆盖 note，头像标记必须还在。
+        avatar.note = "视觉复核：疑似同一个人，但那是dzmm.ai上的页面、不是作者主页（指纹距离 0）"
         other = Candidate(engine="yandex", url="https://example.com/a", distance=26, status="suspect")
         other.finalize()
         outcome = SearchOutcome(

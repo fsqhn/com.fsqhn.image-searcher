@@ -17,6 +17,7 @@ from core.engines import (  # noqa: E402
     LensEngine,
     YandexEngine,
     is_yandex_shell_page,
+    reference_candidates,
     to_yandex_candidate,
     verify_candidate,
 )
@@ -159,6 +160,7 @@ class XPageKindTest(unittest.TestCase):
             handle="@dzmm",
         )
         self.assertEqual(result.status, "suspect")
+        self.assertTrue(result.avatar)
         self.assertIn("站点账号头像", result.note)
         self.assertIn("指纹距离 0", result.note)
         self.assertEqual(result.name, "")
@@ -184,6 +186,46 @@ class XPageKindTest(unittest.TestCase):
     def test_non_x_page_unaffected(self) -> None:
         result = self._verify("https://nudogram.com/models/nenechi890/290/")
         self.assertEqual(result.status, "match")
+
+
+class ReferenceCandidatesTest(unittest.TestCase):
+    """没找到时的参考图要跳过头像命中：距离 0 的头像配上去只会自相矛盾。"""
+
+    def _avatar(self) -> Candidate:
+        item = Candidate(
+            engine="lens",
+            url="https://dzmm.ai/user/x/following",
+            image_url="https://pxlorbit.com/avatar/a.png",
+            distance=0,
+            status="suspect",
+            note="该图是站点账号头像（指纹距离 0），不是帖子原图",
+            avatar=True,
+        )
+        return item
+
+    def test_avatar_hit_is_skipped_even_after_vision_rewrites_note(self) -> None:
+        """视觉降级会改写 note，头像标记不能因此丢掉。"""
+        avatar = self._avatar()
+        avatar.note = "视觉复核：疑似同一个人，但那是dzmm.ai上的页面、不是作者主页（指纹距离 0）"
+        baidu = Candidate(engine="baidu", url="https://example.com/b", distance=12, status="suspect")
+        pool = reference_candidates(None, [avatar, baidu])
+        self.assertEqual(pool, [baidu])
+
+    def test_avatar_hit_is_skipped(self) -> None:
+        avatar = self._avatar()
+        baidu = Candidate(engine="baidu", url="https://example.com/b", distance=12, status="suspect")
+        pool = reference_candidates(None, [avatar, baidu])
+        self.assertEqual(pool, [baidu])
+
+    def test_only_avatars_leave_pool_empty(self) -> None:
+        self.assertEqual(reference_candidates(None, [self._avatar()]), [])
+
+    def test_best_comes_first_and_keeps_everything(self) -> None:
+        avatar = self._avatar()
+        best = Candidate(engine="lens", url="https://x.com/a/status/1", distance=0, status="match")
+        pool = reference_candidates(best, [avatar])
+        self.assertEqual(pool[0], best)
+        self.assertIn(avatar, pool)
 
 
 class LensRetryTest(unittest.TestCase):

@@ -452,6 +452,10 @@ def is_crawler_placeholder(url: str) -> bool:
     return "/seo/google_widget/crawler" in raw or "/lookaside/crawler" in raw
 
 
+# 头像命中的 note 前缀。参考图挑选、结论统计都靠它认出来，改文案时只改这里。
+AVATAR_NOTE = "该图是站点账号头像"
+
+
 _AVATAR_HINTS = ("avatar", "logo", "favicon")
 
 
