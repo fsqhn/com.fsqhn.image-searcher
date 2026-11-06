@@ -465,6 +465,10 @@ def reference_kind(outcome: SearchOutcome, source: str) -> str:
     picked = (outcome.vision or {}).get("picked") or []
     if source in picked:
         return "vision"
+    # 视觉挑中、但落点被降级成疑似的那些也记在 picked_images 里；参考图取自它们时
+    # 同样要标「视觉方案挑中的那张」，别让人以为是引擎按距离挑的。
+    if source in ((outcome.vision or {}).get("picked_images") or []):
+        return "vision"
     return "candidate"
 
 

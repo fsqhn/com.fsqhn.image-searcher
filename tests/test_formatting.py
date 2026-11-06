@@ -423,6 +423,29 @@ class GrokReferenceTest(unittest.TestCase):
         self.assertIn("候选里跟原图最接近的一张", blob)
         self.assertIn("指纹距离 22", blob)
 
+    def test_reference_from_downgraded_vision_pick_is_labelled_vision(self) -> None:
+        """视觉挑中但被降级的那张当参考图时，也要写「视觉方案挑中的那张」。"""
+        item = Candidate(
+            engine="lens",
+            url="https://nowbestshirt.com/p/1",
+            image_url="https://img/p.jpg",
+            distance=24,
+            status="suspect",
+        )
+        item.note = "视觉复核：疑似同一个人，但来自电商商品页（指纹距离 24），仅供参考"
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[item],
+            image_b64="AAAA",
+            image_source="https://img/p.jpg",
+            vision={"ok": True, "picked": [], "picked_images": ["https://img/p.jpg"], "downgraded": 1},
+            total_candidates=1,
+        )
+        blob = json.dumps(build_forward_nodes(_task(outcome), command="盆地找鸡"), ensure_ascii=False)
+        self.assertIn("视觉方案挑中的那张", blob)
+        self.assertIn("指纹距离 24", blob)
+
     def test_reference_at_distance_zero_is_not_called_different(self) -> None:
         """距离 0 就是同一张，不能写成「不是同一张」。"""
         item = Candidate(

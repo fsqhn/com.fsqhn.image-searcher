@@ -1338,15 +1338,15 @@ class ImageSearcherPlugin(MaiBotPlugin):
         best: Candidate | None,
         ordered: list[Candidate],
         upload: bytes | None,
+        picked: list[str] | tuple[str, ...] = (),
     ) -> tuple[str, str]:
         """给结果配图：多个候选并发下载，按优先级取第一张成功的。
 
-        best 为空（没找到可靠出处）时照样给一张参考图，方便用户核对是不是同一张；
-        候选全失败时退回用户原图；没有原图（比如重放磁盘恢复的任务）就返回空。
+        best 为空（没找到可靠出处）时照样给一张参考图，方便用户核对是不是同一张：
+        视觉方案挑中的那张排最前，其次才是指纹距离最近的。候选全失败时退回用户
+        原图；没有原图（比如重放磁盘恢复的任务）就返回空。
         """
-        # 没找到可靠出处时，配图取候选里跟原图最接近的那张（跳过头像命中），
-        # 不能按引擎顺序拿第一条——那样「参考图」看起来就像随手抓的。
-        pool = reference_candidates(best, ordered)
+        pool = reference_candidates(best, ordered, picked)
         urls: list[str] = []
         for item in pool:
             if item is None:
@@ -1377,7 +1377,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return
         if outcome.best is None and not outcome.candidates:
             return
-        image_b64, source = await self._best_image(outcome.best, outcome.candidates, None)
+        image_b64, source = await self._best_image(
+            outcome.best,
+            outcome.candidates,
+            None,
+            (outcome.vision or {}).get("picked_images") or (),
+        )
         if image_b64:
             outcome.image_b64 = image_b64
             outcome.image_source = source
@@ -1461,7 +1466,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 outcome.cached = True
                 outcome.cached_at = hit.stored_at
                 outcome.image_b64, outcome.image_source = await self._best_image(
-                    outcome.best, outcome.candidates, upload
+                    outcome.best,
+                    outcome.candidates,
+                    upload,
+                    (outcome.vision or {}).get("picked_images") or (),
                 )
                 self._vlog(
                     "按图缓存命中：状态=%s 候选=%s 存于=%s（%.1f 天前）",
@@ -1708,7 +1716,12 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 outcome.image_b64 = base64.b64encode(compact).decode("ascii")
                 outcome.image_source = "upload"
         elif best is not None or ordered or upload:
-            outcome.image_b64, outcome.image_source = await self._best_image(best, ordered, upload)
+            outcome.image_b64, outcome.image_source = await self._best_image(
+                best,
+                ordered,
+                upload,
+                (vision_info or {}).get("picked_images") or (),
+            )
 
         # 视觉和 Grok 各自挑出一张时，两张都给：视觉那张已经是 best 的首图，
         # 这里补上 Grok 帖子配图里最近的一张，方便一眼对照。
@@ -1915,6 +1928,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
             "ok": False,
             "checked": 0,
             "picked": [],
+            # 视觉挑中的全部图片地址（含后来降级的）。挑参考图时优先用它们：
+            # 模型说「同一个人」的那张，比指纹更近、模型却没认过的图更有对照价值。
+            "picked_images": [],
             "downgraded": 0,
             "reason": "",
             "model": "",
@@ -2039,6 +2055,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 # 保持头像说明，也不并进视觉降级的统计。
                 continue
             distance = candidate.distance
+            if candidate.image_url:
+                info["picked_images"].append(candidate.image_url)
             gap = (
                 f"指纹距离 {distance}，超过阈值 {self.config.plugin.hash_threshold}"
                 if distance is not None

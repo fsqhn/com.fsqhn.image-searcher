@@ -220,6 +220,20 @@ class ReferenceCandidatesTest(unittest.TestCase):
     def test_only_avatars_leave_pool_empty(self) -> None:
         self.assertEqual(reference_candidates(None, [self._avatar()]), [])
 
+    def test_vision_pick_comes_before_closer_candidate(self) -> None:
+        """视觉挑中的那张比指纹更近的图更值得当参考。"""
+        closer = Candidate(engine="lens", url="https://example.com/c", image_url="https://img/c.jpg", distance=20, status="mismatch")
+        picked = Candidate(engine="lens", url="https://example.com/p", image_url="https://img/p.jpg", distance=24, status="suspect")
+        pool = reference_candidates(None, [closer, picked], ["https://img/p.jpg"])
+        self.assertEqual(pool[0], picked)
+        self.assertEqual(pool[1], closer)
+
+    def test_avatar_pick_still_skipped(self) -> None:
+        avatar = self._avatar()
+        other = Candidate(engine="baidu", url="https://example.com/b", image_url="https://img/b.jpg", distance=12, status="suspect")
+        pool = reference_candidates(None, [avatar, other], ["https://pxlorbit.com/avatar/a.png"])
+        self.assertEqual(pool, [other])
+
     def test_best_comes_first_and_keeps_everything(self) -> None:
         avatar = self._avatar()
         best = Candidate(engine="lens", url="https://x.com/a/status/1", distance=0, status="match")

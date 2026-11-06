@@ -682,18 +682,24 @@ def detect_ai(
 
 
 def reference_candidates(
-    best: Candidate | None, ordered: list[Candidate]
+    best: Candidate | None,
+    ordered: list[Candidate],
+    picked: list[str] | tuple[str, ...] = (),
 ) -> list[Candidate]:
     """挑参考图时的候选顺序。
 
-    没有 best 时按距离从近到远排，并跳过头像命中：那是账号头像，距离常常是 0，
-    拿来当参考图会写成「距离 0，不是同一张」这种自相矛盾的话，页面里还看不到它。
+    没有 best 时，视觉方案挑中的候选排在最前——模型说「同一个人、同款衣服」的那张，
+    比一条指纹距离更小、但模型没认过的图更有对照价值；其次按距离从近到远排。
+    头像命中的一律跳掉：那是账号头像，距离常常是 0，拿来当参考图会写成
+    「距离 0，不是同一张」这种自相矛盾的话，页面里还看不到它。
     """
     if best is not None:
         return [best, *ordered]
+    picks = set(picked or ())
     return sorted(
         (item for item in ordered if not is_avatar_hit(item)),
         key=lambda item: (
+            0 if item.image_url and item.image_url in picks else 1,
             item.distance is None,
             item.distance if item.distance is not None else 999,
         ),
