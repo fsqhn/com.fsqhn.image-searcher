@@ -715,6 +715,43 @@ class SplitForwardsTest(unittest.TestCase):
         self.assertNotIn("X 搜索指向这个账号", tail)
         self.assertIn("任务编号", tail)
 
+    def test_grok_found_post_does_not_contradict_with_not_found(self) -> None:
+        """Grok 已给出原帖时，尾部再说「未找到可靠出处」就是自相矛盾（s-20261106-1659）。"""
+        item = Candidate(
+            engine="lens",
+            url="https://x.com/other/status/1",
+            image_url="https://img/a.jpg",
+            distance=22,
+            status="mismatch",
+        )
+        outcome = SearchOutcome(
+            status="ok",
+            best=None,
+            candidates=[item],
+            grok={
+                "ok": True,
+                "tier": "post",
+                "handle": "Wunaijiangonly",
+                "post_url": "https://x.com/Wunaijiangonly/status/2118547517633933360",
+                "distance": 0,
+                "reason": "翻了该号的带图帖子，这张图就在里面",
+            },
+            image_b64="AAAA",
+            image_source="upload",
+            total_candidates=1,
+        )
+        blocks = build_result_forwards(_task(outcome), command="盆地找鸡")
+        blob = "\n".join(
+            part["content"]
+            for block in blocks
+            for node in block
+            for part in node.get("content") or []
+            if part.get("type") == "text"
+        )
+        self.assertIn("找到 X 上的原帖", blob)
+        self.assertIn("见上一条", blob)
+        self.assertNotIn("未找到可靠出处", blob)
+
     def test_not_found_suspects_say_distance_range(self) -> None:
         """未找到时的疑似条目要说清是同角色/同款，并标出指纹距离区间。"""
         low = Candidate(engine="yandex", url="https://example.com/a", distance=24, status="suspect")

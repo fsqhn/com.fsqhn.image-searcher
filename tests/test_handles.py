@@ -107,6 +107,42 @@ class AnchorTest(unittest.TestCase):
         )
 
 
+class SlugMatchTest(unittest.TestCase):
+    def test_name_in_url_path_wins(self) -> None:
+        """fapeza/fapello 的路径就是它认定的主人名，标题里的别名不算。"""
+        urls = ["https://fapeza.com/heyymimimi/62/", "https://fapello.com/heyymimimi/85/"]
+        self.assertTrue(handles.in_url_slug("heyymimimi", urls))
+        self.assertFalse(handles.in_url_slug("heyimbee", urls))
+
+    def test_short_or_empty_names_do_not_match(self) -> None:
+        urls = ["https://example.com/mimi/1/"]
+        self.assertFalse(handles.in_url_slug("mi", urls))
+        self.assertFalse(handles.in_url_slug("", urls))
+
+    def test_pick_prefers_url_slug_over_followers(self) -> None:
+        """1658 那单：标题并列 heyimbee 与 heyymimimi，路径里是后者，就选后者。"""
+        options = [
+            {"guess": "heyimbee", "handle": "heyimbee", "followers": 568882},
+            {"guess": "heyymimimi", "handle": "heyymimimi", "followers": 22775},
+        ]
+        urls = ["https://fapeza.com/heyymimimi/62/"]
+        self.assertEqual(handles.pick_by_slug(options, urls)["handle"], "heyymimimi")
+
+    def test_pick_falls_back_to_followers(self) -> None:
+        """路径里谁都没出现时，仍按粉丝数挑最像的那个。"""
+        options = [
+            {"guess": "kuuko_w", "handle": "kuuko_w", "followers": 1200},
+            {"guess": "kuukow002", "handle": "kuukow002", "followers": 98000},
+        ]
+        self.assertEqual(
+            handles.pick_by_slug(options, ["https://example.com/gallery/1/"])["handle"],
+            "kuukow002",
+        )
+
+    def test_pick_empty_options(self) -> None:
+        self.assertIsNone(handles.pick_by_slug([], []))
+
+
 class BlockedSourceTest(unittest.TestCase):
     """约稿平台、电商页的标题写的是页面主人，不能拿来推作者。"""
 

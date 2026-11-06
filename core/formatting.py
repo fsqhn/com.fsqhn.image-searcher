@@ -719,14 +719,25 @@ def _tail_nodes(
     """最后一条：没找到时给结论、参考图和参考区，然后统一收尾。"""
     nodes: list[dict] = []
     if outcome.best is None:
-        # Grok 已经单独占一条时，这里不要再重复它的结论。
-        nodes.append(
-            _node(
-                [{"type": "text", "content": _best_block(outcome, skip_grok=grok_taken)}],
-                nickname,
-                user_id,
+        grok = outcome.grok or {}
+        if grok_taken and grok.get("tier") == "post":
+            # 原帖已经在 Grok 那块给出来了，这里再写「未找到可靠出处」等于自相矛盾。
+            nodes.append(
+                _node(
+                    [{"type": "text", "content": "🔗 找到的原帖和依据见上一条，下面是参考图与候选。"}],
+                    nickname,
+                    user_id,
+                )
             )
-        )
+        else:
+            # Grok 已经单独占一条时，这里不要再重复它的结论。
+            nodes.append(
+                _node(
+                    [{"type": "text", "content": _best_block(outcome, skip_grok=grok_taken)}],
+                    nickname,
+                    user_id,
+                )
+            )
         grok_ref = str((outcome.grok or {}).get("reference_url") or "")
         grok_gave_image = grok_taken and outcome.image_source == grok_ref
         if outcome.image_b64 and not grok_gave_image:

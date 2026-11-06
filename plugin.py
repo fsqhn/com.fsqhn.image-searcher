@@ -2648,7 +2648,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return None
         profiles = await asyncio.gather(*(self._profile(name) for name in names))
         known = {str(item.handle or "").lower() for item in ordered if item.handle}
-        best: dict[str, Any] | None = None
+        urls = [item.url for item in rows if item.url]
+        found: list[dict[str, Any]] = []
         for name, info in zip(names, profiles):
             if not info:
                 continue
@@ -2668,8 +2669,6 @@ class ImageSearcherPlugin(MaiBotPlugin):
             ):
                 self._vlog("疑似 X 账号：@%s 跟已对上的名字对不上，丢掉", name)
                 continue
-            if best is not None and followers <= best["followers"]:
-                continue
             lower_name = name.lower()
             source = next(
                 (
@@ -2686,25 +2685,36 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 ),
                 None,
             )
-            best = {
-                "handle": str(info.get("screen_name") or name),
-                "followers": followers,
-                "name": str(info.get("name") or "")[:40],
-                "source_url": source.url if source is not None else "",
-                "source_platform": source.platform if source is not None else "",
-                "source_title": " ".join((source.title or source.name or "").split())[:60]
-                if source is not None
-                else "",
-                "score": score,
-            }
-        if best:
-            self._vlog(
-                "疑似 X 账号：@%s 粉丝=%s 来源=%s 标题=%s",
-                best["handle"],
-                best["followers"],
-                best["source_platform"] or "-",
-                best["source_title"] or "-",
+            found.append(
+                {
+                    "handle": str(info.get("screen_name") or name),
+                    "followers": followers,
+                    "name": str(info.get("name") or "")[:40],
+                    "source_url": source.url if source is not None else "",
+                    "source_platform": source.platform if source is not None else "",
+                    "source_title": " ".join((source.title or source.name or "").split())[:60]
+                    if source is not None
+                    else "",
+                    "score": score,
+                    "guess": name,
+                    "slug": handles.in_url_slug(name, urls),
+                }
             )
+        if not found:
+            return None
+        # 搬运站的标题常并列好几个别名（「cw / heyimbee / heyymimimi」）。只按粉丝
+        # 挑会选中最出名的那个，而它可能只是顺带抄进来的无关大号——实测 fapeza 这
+        # 单就挑了 56 万粉的 @heyimbee，实际是路径里的 @heyymimimi。站点自己的路径
+        # 更接近「这套图是谁」，所以路径里出现过的名字优先，其次才比粉丝。
+        best = handles.pick_by_slug(found, urls)
+        self._vlog(
+            "疑似 X 账号：@%s 粉丝=%s 路径命中=%s 来源=%s 标题=%s",
+            best["handle"],
+            best["followers"],
+            "是" if best["slug"] else "否",
+            best["source_platform"] or "-",
+            best["source_title"] or "-",
+        )
         return best
 
     # 泄露站按名字建收录页：有页说明这个人确实在做 OnlyFans，没页返回 404。
@@ -2767,7 +2777,8 @@ class ImageSearcherPlugin(MaiBotPlugin):
             return None
         pages = await asyncio.gather(*(self._paid_probe(name) for name in names))
         known = {str(item.handle or "").lower() for item in ordered if item.handle}
-        best: dict[str, Any] | None = None
+        urls = [item.url for item in rows if item.url]
+        found: list[dict[str, Any]] = []
         for name, info in zip(names, pages):
             if not info:
                 continue
@@ -2782,9 +2793,6 @@ class ImageSearcherPlugin(MaiBotPlugin):
             ):
                 self._vlog("付费线索：%s 跟已对上的名字对不上，丢掉", name)
                 continue
-            # 名字越长越具体，同一批里取最具体的那个，避免短词命中别人的页。
-            if best is not None and score <= best["score"]:
-                continue
             lower = name.lower()
             stem = handles.stem(name)
             source = next(
@@ -2794,20 +2802,37 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 (item for item in rows if stem in self._name_text(item).lower()),
                 None,
             )
-            best = {
-                "handle": name,
-                "name": str(info.get("name") or name)[:40],
-                "page_url": str(info.get("page_url") or ""),
-                "source_url": source.url if source is not None else "",
-                "source_platform": source.platform if source is not None else "",
-                "source_title": " ".join((source.title or source.name or "").split())[:60]
-                if source is not None
-                else "",
-                "score": score,
-                "x_handle": "",
-                "x_followers": 0,
-                "instagram": "",
-            }
+            found.append(
+                {
+                    "guess": name,
+                    "handle": name,
+                    "name": str(info.get("name") or name)[:40],
+                    "page_url": str(info.get("page_url") or ""),
+                    "source_url": source.url if source is not None else "",
+                    "source_platform": source.platform if source is not None else "",
+                    "source_title": " ".join((source.title or source.name or "").split())[:60]
+                    if source is not None
+                    else "",
+                    "score": score,
+                    "x_handle": "",
+                    "x_followers": 0,
+                    "instagram": "",
+                }
+            )
+        if not found:
+            return None
+        # 名字选法跟疑似 X 账号一致：站点路径里的名字比标题里并列的别名可信。
+        # 路径里的名字在泄露站没有收录页时宁可不说——把别人的付费号安上来，
+        # 比少一行提示严重得多。
+        slugged = [item for item in found if handles.in_url_slug(item["guess"], urls)]
+        if slugged:
+            best = max(slugged, key=lambda item: item["score"])
+        elif any(handles.in_url_slug(name, urls) for name in names):
+            self._vlog("付费线索：路径里的名字在泄露站没有收录页，不再拿并列别名顶上")
+            return None
+        else:
+            # 名字越长越具体，同一批里取最具体的那个，避免短词命中别人的页。
+            best = max(found, key=lambda item: item["score"])
         if not best:
             return None
         profile = await self._profile(best["handle"])

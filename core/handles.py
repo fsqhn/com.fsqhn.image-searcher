@@ -70,6 +70,29 @@ def stem(handle: str) -> str:
     return re.sub(r"[_\d]+$", "", (handle or "").lower())
 
 
+def in_url_slug(name: str, urls: list[str]) -> bool:
+    """这个名字是不是出现在候选 URL 里（搬运站的路径通常就是它认定的主人名）。
+
+    标题常把好几个别名并列（「cw / heyimbee / heyymimimi」），只按粉丝挑会选中最
+    出名的那个，而它可能只是被顺手抄进来的大号。站点自己的路径更接近「这套图是谁」。
+    """
+    core = stem(name)
+    if len(core) < 4:
+        return False
+    return any(core in (url or "").lower() for url in urls)
+
+
+def pick_by_slug(options: list[dict], urls: list[str]) -> dict | None:
+    """挑一个候选账号：名字在 URL 路径里出现过的优先，其余按粉丝数最大。
+
+    options 里每项要有 `guess`（标题里抽出来的名字）和 `followers`。
+    """
+    if not options:
+        return None
+    slugged = [item for item in options if in_url_slug(str(item.get("guess") or ""), urls)]
+    return max(slugged or options, key=lambda item: int(item.get("followers") or 0))
+
+
 def match_score(handle: str, texts: list[str]) -> int:
     """这个名字是否真的出现在候选标题里。返回主干长度，0 表示没有。
 
