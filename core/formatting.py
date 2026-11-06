@@ -379,10 +379,12 @@ def engine_groups(
 
 
 def candidate_image(outcome: SearchOutcome, item: Candidate) -> str:
-    """取候选的展示图；已经作为参考图单独贴过的不要重复。"""
+    """取候选的展示图。
+
+    参考区里每个引擎都要有「自己最接近的那张」的配图，所以即使这张已经当过
+    顶部的参考图，这里也照样返回；否则那个引擎的列表看起来就像没配上图。
+    """
     if not item.image_url:
-        return ""
-    if outcome.best is None and outcome.image_b64 and item.image_url == outcome.image_source:
         return ""
     return (outcome.images or {}).get(item.image_url, "")
 
@@ -433,6 +435,37 @@ def _reference_distance(outcome: SearchOutcome, source: str) -> int | None:
     return None
 
 
+def reference_kind(outcome: SearchOutcome, source: str) -> str:
+    """参考图是哪来的：vision（视觉方案挑的）/ grok（Grok 帖子配图）/ candidate。
+
+    群里看到一张图总得知道它是谁给的，否则容易把「视觉挑的」当成「引擎搜到的」。
+    """
+    if not source:
+        return "candidate"
+    grok_ref = str((outcome.grok or {}).get("reference_url") or "")
+    if grok_ref and source == grok_ref:
+        return "grok"
+    picked = (outcome.vision or {}).get("picked") or []
+    if source in picked:
+        return "vision"
+    return "candidate"
+
+
+def _reference_hint(outcome: SearchOutcome, source: str) -> str:
+    """参考图的标题：点明来源，并标出跟原图的指纹距离。"""
+    distance = _reference_distance(outcome, source)
+    gap = f"指纹距离 {distance}" if distance is not None else "未经指纹确认"
+    kind = reference_kind(outcome, source)
+    if kind == "grok":
+        return f"📋 参考图（Grok 帖子配图里跟原图最接近的一张，{gap}，不是同一张）"
+    if kind == "vision":
+        return f"📋 参考图（视觉方案挑中的那张，{gap}，不是同一张）"
+    return (
+        f"📋 参考图（引擎候选里跟原图最接近的一张，{gap}，不是同一张；"
+        "不是视觉方案挑的，也不是 Grok 给的）"
+    )
+
+
 def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay: bool, task_id: str = "") -> list[str]:
     lines = [_route_line(outcome), _ai_line(outcome.ai)]
     if outcome.cached:
@@ -441,11 +474,13 @@ def _footer_lines(outcome: SearchOutcome, command: str, ttl_minutes: int, replay
     if outcome.image_b64 and outcome.image_source == "upload":
         lines.append("（候选图都没取到，转发里的图是你发的原图）")
     elif outcome.image_b64 and outcome.best is None:
-        grok_ref = str((outcome.grok or {}).get("reference_url") or "")
         distance = _reference_distance(outcome, outcome.image_source)
         suffix = f"，指纹距离 {distance}，不是同一张" if distance is not None else "，未经指纹确认"
-        if grok_ref and outcome.image_source == grok_ref:
+        kind = reference_kind(outcome, outcome.image_source)
+        if kind == "grok":
             lines.append(f"（参考图是 Grok 给的帖子里跟原图最接近的一张{suffix}）")
+        elif kind == "vision":
+            lines.append(f"（参考图是视觉方案挑中的那张{suffix}）")
         else:
             lines.append(f"（参考区那张是候选里跟原图最接近的一张{suffix}）")
     if outcome.errors:
@@ -516,13 +551,7 @@ def build_forward_nodes(
 
     # 没找到可靠出处时，先单独给一张参考图，方便用户自己核对是不是同一张。
     if outcome.best is None and outcome.image_b64:
-        grok_ref = str((outcome.grok or {}).get("reference_url") or "")
-        distance = _reference_distance(outcome, outcome.image_source)
-        gap = f"，指纹距离 {distance}" if distance is not None else ""
-        if grok_ref and outcome.image_source == grok_ref:
-            hint = f"📋 参考图（Grok 帖子配图里跟原图最接近的一张{gap}，不是同一张）"
-        else:
-            hint = f"📋 参考图（候选里跟原图最接近的一张{gap}，不是同一张）"
+        hint = _reference_hint(outcome, outcome.image_source)
         nodes.append(
             node(
                 [
@@ -656,12 +685,7 @@ def _tail_nodes(
         grok_ref = str((outcome.grok or {}).get("reference_url") or "")
         grok_gave_image = grok_taken and outcome.image_source == grok_ref
         if outcome.image_b64 and not grok_gave_image:
-            distance = _reference_distance(outcome, outcome.image_source)
-            gap = f"，指纹距离 {distance}" if distance is not None else ""
-            if grok_ref and outcome.image_source == grok_ref:
-                hint = f"📋 参考图（Grok 帖子配图里跟原图最接近的一张{gap}，不是同一张）"
-            else:
-                hint = f"📋 参考图（候选里跟原图最接近的一张{gap}，不是同一张）"
+            hint = _reference_hint(outcome, outcome.image_source)
             nodes.append(
                 _node(
                     [

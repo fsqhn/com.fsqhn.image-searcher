@@ -212,8 +212,8 @@ class ForwardNodesTest(unittest.TestCase):
         self.assertIn("▍Google Lens（1 条）", text)
         self.assertNotIn("artworks/2", text)
 
-    def test_reference_image_is_not_repeated_in_engine_group(self) -> None:
-        """没找到匹配时那张参考图已经单独贴过，分组里不能再贴一次同一张。"""
+    def test_every_engine_group_shows_its_closest_image(self) -> None:
+        """参考图同时是某个引擎最接近的那张时，该引擎分组里也要再给一次。"""
         outcome = self._grouped_outcome()
         outcome.best = None
         outcome.status = "not_found"
@@ -221,7 +221,7 @@ class ForwardNodesTest(unittest.TestCase):
         outcome.image_source = "https://img.example/1.jpg"
         outcome.images = {"https://img.example/1.jpg": "REF", "https://img.example/3.jpg": "YANDEX1"}
         nodes = build_forward_nodes(_task(outcome), command="麦麦寻人")
-        self.assertEqual(_images(nodes), [(2, "REF"), (4, "YANDEX1")])
+        self.assertEqual(_images(nodes), [(2, "REF"), (3, "REF"), (4, "YANDEX1")])
 
     def test_engine_group_sorted_by_distance(self) -> None:
         """组内按指纹距离从近到远排，第一条就是该引擎最接近的那张。"""
@@ -414,6 +414,57 @@ class GrokReferenceTest(unittest.TestCase):
         blob = json.dumps(nodes, ensure_ascii=False)
         self.assertIn("候选里跟原图最接近的一张", blob)
         self.assertIn("指纹距离 22", blob)
+
+    def test_reference_image_from_vision_is_labelled(self) -> None:
+        """参考图是视觉方案挑的那张时，标题要写明，别让人以为是引擎直接搜到的。"""
+        item = Candidate(
+            engine="lens",
+            url="https://example.com/a",
+            image_url="https://img/v.jpg",
+            distance=19,
+            status="suspect",
+            note="视觉复核：疑似同一个人，仅供参考",
+        )
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[item],
+            vision={
+                "ok": True,
+                "checked": 10,
+                "picked": ["https://img/v.jpg"],
+                "downgraded": 1,
+                "reason": "同款服装",
+            },
+            image_b64="VIS",
+            image_source="https://img/v.jpg",
+            total_candidates=1,
+        )
+        nodes = build_forward_nodes(_task(outcome), command="盆地找鸡")
+        blob = json.dumps(nodes, ensure_ascii=False)
+        self.assertIn("视觉方案挑中的那张", blob)
+        self.assertNotIn("不是视觉方案挑的", blob)
+
+    def test_reference_image_says_when_it_is_neither_vision_nor_grok(self) -> None:
+        item = Candidate(
+            engine="lens",
+            url="https://example.com/a",
+            image_url="https://img/a.jpg",
+            distance=25,
+            status="mismatch",
+        )
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[item],
+            vision={"ok": True, "checked": 8, "picked": [], "downgraded": 0, "reason": "都不像"},
+            image_b64="AAAA",
+            image_source="https://img/a.jpg",
+            total_candidates=1,
+        )
+        nodes = build_forward_nodes(_task(outcome), command="盆地找鸡")
+        blob = json.dumps(nodes, ensure_ascii=False)
+        self.assertIn("不是视觉方案挑的，也不是 Grok 给的", blob)
 
     def test_footer_explains_grok_reference_image(self) -> None:
         ref = "https://pbs.twimg.com/media/abc.jpg"

@@ -1407,8 +1407,10 @@ class ImageSearcherPlugin(MaiBotPlugin):
     async def _ensure_engine_images(self, task: SearchTask, *, limit: int, whole: bool) -> None:
         """给参考区的候选配图。
 
-        首次回复只取每个引擎最接近的那张，回「更多」时把展示范围内的候选全配上。
-        展示图压到 100KB 左右，避免合并转发因为体积太大被拒。
+        首次回复给每个引擎最接近的那张，回「更多」时把展示范围内的候选全配上。
+        某个引擎最接近的那张即便已经在顶部当过参考图，这里也照样补一份，否则
+        那个引擎的列表看起来就像没配图。展示图压到 100KB 左右，避免合并转发
+        因为体积太大被拒。
         """
         outcome = task.outcome
         if outcome is None or not outcome.candidates:
@@ -1426,8 +1428,6 @@ class ImageSearcherPlugin(MaiBotPlugin):
         for url in targets:
             if url in outcome.images or url in pending:
                 continue
-            if outcome.best is None and url == outcome.image_source:
-                continue  # 已经作为参考图贴过，不重复
             pending.append(url)
         if not pending:
             return
