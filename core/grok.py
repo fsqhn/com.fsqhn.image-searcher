@@ -77,6 +77,21 @@ def social_first(candidates: list) -> list:
     )
 
 
+def model_chain(primary: str, extras: list[str] | None = None) -> list[str]:
+    """按顺序排好要尝试的模型：主模型在前，备用去重后接上。
+
+    中转站会轮流挂 4.7 和 4.6，配置里给两个模型时，前一个超时或回 5xx 就换
+    下一个，不用把整单拖到超时结束。
+    """
+    first = (primary or "").strip() or "grok-4.7"
+    chain = [first]
+    for item in extras or []:
+        name = str(item).strip()
+        if name and name not in chain:
+            chain.append(name)
+    return chain
+
+
 def build_hints(candidates: list, limit: int = 8) -> list[str]:
     """把候选整理成给 Grok 看的清单：账号优先，其次标题。
 

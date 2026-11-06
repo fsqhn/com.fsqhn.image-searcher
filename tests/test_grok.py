@@ -28,6 +28,22 @@ def _body(text: str, urls: list[str] | None = None, tools: list[str] | None = No
     return {"model": "grok-4.7", "output": output, "usage": {"input_tokens": 100}}
 
 
+class ModelChainTest(unittest.TestCase):
+    def test_primary_first_then_backup(self):
+        self.assertEqual(
+            grok.model_chain("grok-4.7", ["grok-4.6"]), ["grok-4.7", "grok-4.6"]
+        )
+
+    def test_dedupes_and_skips_blank(self):
+        self.assertEqual(
+            grok.model_chain("grok-4.7", [" grok-4.7 ", "", "grok-4.6", "grok-4.6"]),
+            ["grok-4.7", "grok-4.6"],
+        )
+
+    def test_blank_primary_falls_back_to_default(self):
+        self.assertEqual(grok.model_chain("", []), ["grok-4.7"])
+
+
 class BuildPayloadTest(unittest.TestCase):
     def test_uses_responses_shape(self) -> None:
         body = grok.build_payload("grok-4.7", "data:image/jpeg;base64,AAA")

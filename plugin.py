@@ -401,6 +401,17 @@ class GrokConfig(PluginConfigBase):
         description="用哪个模型。填服务商实际提供的名字，需要支持图输入和 x_search。",
         json_schema_extra=_ui("模型", "以服务商提供的模型名为准，默认 grok-4.7。", placeholder="grok-4.7"),
     )
+    models: list[str] = Field(
+        default_factory=lambda: ["grok-4.7", "grok-4.6"],
+        description=(
+            "按顺序尝试的模型：前一个超时、连不上或服务端 5xx 就换下一个。"
+            "实测中转站会轮流挂 4.7 和 4.6，配成两个能明显提高成功率。留空则只用上面的 model。"
+        ),
+        json_schema_extra=_ui(
+            "备用模型（按顺序）",
+            "默认依次试 grok-4.7、grok-4.6；前一个挂了自动换下一个。",
+        ),
+    )
     timeout: int = Field(
         default=120,
         description=(
@@ -2067,7 +2078,9 @@ class ImageSearcherPlugin(MaiBotPlugin):
         if not base:
             info["error"] = "没有配置 Base URL"
             return info
-        model = (section.model or "").strip() or "grok-4.7"
+        # 中转站会轮流挂 4.7 和 4.6：主模型失败就换下一个，别在同一棵树上等死。
+        models = grok.model_chain(section.model, getattr(section, "models", None))
+        model = models[0]
         try:
             compact, _ = prepare_upload(upload, limit=900_000, as_jpeg=True)
         except Exception as error:  # noqa: BLE001 - 图片处理失败不该影响其他兜底
@@ -2087,30 +2100,32 @@ class ImageSearcherPlugin(MaiBotPlugin):
         repost_note = "、".join(reposts[:3])
         if reposts:
             self._vlog("Grok 提示：候选里有转发页 %s", repost_note)
-        body = grok.build_payload(model, data_url, hints=hints, repost_note=repost_note)
         timeout = max(15, int(section.timeout))
         proxy = self.config.plugin.proxy
 
-        def call(seconds: int) -> dict:
+        def call(payload_body: dict, seconds: int) -> dict:
             session = make_session(proxy, headers={"Authorization": f"Bearer {key}"})
             try:
-                response = session.post(f"{base}/responses", json=body, timeout=seconds)
+                response = session.post(f"{base}/responses", json=payload_body, timeout=seconds)
                 if response.status_code != 200:
                     raise HttpError(f"HTTP {response.status_code}：{response.text[:160]}")
                 return response.json()
             finally:
                 session.close()
 
-        # 中转站偶尔一口气卡满超时（实测那次 Read timed out 120 秒），隔两秒重试
-        # 一次通常就过去了；服务端明确回 4xx/5xx 的不重试，那是请求本身的问题。
-        attempts = [timeout, max(30, min(60, timeout // 2))]
+        # 每个模型各等一次完整超时；都试完再用短超时把主模型补一次——中转站的
+        # 抖动常常是瞬时的，但同一模型连续卡死时，换模型比干等更管用。
+        attempts: list[tuple[str, int]] = [(name, timeout) for name in models]
+        attempts.append((model, max(30, min(60, timeout // 2))))
         started = time.time()
         payload: dict | None = None
-        for index, seconds in enumerate(attempts):
+        for index, (name, seconds) in enumerate(attempts):
+            body = grok.build_payload(name, data_url, hints=hints, repost_note=repost_note)
             try:
                 payload = await asyncio.wait_for(
-                    asyncio.to_thread(call, seconds), timeout=seconds + 5
+                    asyncio.to_thread(call, body, seconds), timeout=seconds + 5
                 )
+                model = name
                 break
             except asyncio.TimeoutError:
                 info["error"] = f"中转站 {seconds} 秒内没响应"
@@ -2120,15 +2135,25 @@ class ImageSearcherPlugin(MaiBotPlugin):
                 elif isinstance(error, requests.exceptions.ConnectionError):
                     info["error"] = "中转站连不上"
                 else:
-                    info["error"] = f"Grok 调用失败：{str(error)[:100]}"
-                transient = isinstance(
-                    error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
-                )
-                if not transient:
+                    info["error"] = f"调用 {name} 失败：{str(error)[:100]}"
+                message = str(error)
+                # key 失效换模型也没用；超时、连不上、5xx、模型不存在都换下一个。
+                if isinstance(error, HttpError) and ("HTTP 401" in message or "HTTP 403" in message):
+                    break
+                if not isinstance(
+                    error,
+                    (requests.exceptions.Timeout, requests.exceptions.ConnectionError, HttpError),
+                ):
                     break
             if index + 1 < len(attempts):
-                self._vlog("Grok 这次没成（%s），2 秒后重试一次", info["error"])
+                next_name = attempts[index + 1][0]
+                if next_name == name:
+                    self._vlog("Grok %s 这次没成（%s），2 秒后重试一次", name, info["error"])
+                else:
+                    self._vlog("Grok %s 没成（%s），换 %s", name, info["error"], next_name)
                 await asyncio.sleep(2)
+        if payload is None and len(models) > 1:
+            info["error"] = f"{info['error']}（试过 {'、'.join(models)}）"
         if payload is not None:
             result = grok.parse_output(payload, model=model)
             info.update(
