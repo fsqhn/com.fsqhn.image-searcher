@@ -82,6 +82,14 @@ class ForwardNodesTest(unittest.TestCase):
         )
         self.assertIn("参考图", joined)
 
+    def test_upload_reference_is_labelled_as_original(self) -> None:
+        """一个候选图都没下到时，参考图其实是用户原图，别写成「候选里最近的一张」。"""
+        outcome = SearchOutcome(status="not_found", best=None, candidates=[], image_b64="UPIMG", image_source="upload")
+        nodes = build_forward_nodes(_task(outcome), command="麦麦寻人", show_reference=False)
+        blob = json.dumps(nodes, ensure_ascii=False)
+        self.assertIn("这张是你发的原图", blob)
+        self.assertNotIn("引擎候选里跟原图最接近的一张", blob)
+
     def _grouped_outcome(self, *, hit: bool = True) -> SearchOutcome:
         best = Candidate(
             engine="saucenao",

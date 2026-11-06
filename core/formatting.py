@@ -442,6 +442,8 @@ def reference_kind(outcome: SearchOutcome, source: str) -> str:
     """
     if not source:
         return "candidate"
+    if source == "upload":
+        return "upload"
     grok_ref = str((outcome.grok or {}).get("reference_url") or "")
     if grok_ref and source == grok_ref:
         return "grok"
@@ -456,6 +458,8 @@ def _reference_hint(outcome: SearchOutcome, source: str) -> str:
     distance = _reference_distance(outcome, source)
     gap = f"指纹距离 {distance}" if distance is not None else "未经指纹确认"
     kind = reference_kind(outcome, source)
+    if kind == "upload":
+        return "📋 参考图（候选图都没取到，这张是你发的原图，没有可对照的候选）"
     if kind == "grok":
         return f"📋 参考图（Grok 帖子配图里跟原图最接近的一张，{gap}，不是同一张）"
     if kind == "vision":
