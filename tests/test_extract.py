@@ -328,6 +328,14 @@ class AvatarImageTest(unittest.TestCase):
         self.assertTrue(is_avatar_image("https://site.example.com/static/logo-256.png"))
         self.assertTrue(is_avatar_image("https://site.example.com/favicon.ico"))
 
+    def test_x_profile_image_is_detected(self) -> None:
+        """X 的头像地址不带 avatar 字样，s-20261106-1642 就是栽在这里。"""
+        self.assertTrue(
+            is_avatar_image(
+                "https://pbs.twimg.com/profile_images/2062750521325391872/Gk7_NOC2_400x400.jpg"
+            )
+        )
+
     def test_normal_image_url_is_not_avatar(self) -> None:
         self.assertFalse(is_avatar_image("https://cdn.example.com/photos/2026/miku-01.jpg"))
         self.assertFalse(is_avatar_image("https://hentaiera.com/gallery/1741778/cover.jpg"))

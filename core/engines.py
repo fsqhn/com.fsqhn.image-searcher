@@ -98,9 +98,15 @@ class Candidate:
 def is_avatar_hit(item: Candidate) -> bool:
     """这条命中是不是「站点账号头像」。
 
-    新版记录看 `avatar` 字段；旧摘要没有这个字段，退回 note 前缀判断。
+    新版记录看 `avatar` 字段（按地址判定，跟距离无关）；旧摘要没有这个字段，
+    退回 note 前缀，再看图片地址——X 的 `profile_images` 这类地址以前没识别，
+    旧记录只能靠这一步补上。
     """
-    return bool(getattr(item, "avatar", False)) or (item.note or "").startswith(AVATAR_NOTE)
+    if bool(getattr(item, "avatar", False)):
+        return True
+    if (item.note or "").startswith(AVATAR_NOTE):
+        return True
+    return is_avatar_image(item.image_url)
 
 
 def _timeout(seconds: float) -> tuple[float, float]:
@@ -770,21 +776,23 @@ def verify_candidate(
 
     distance = hamming(target_hash, candidate_hash)
     candidate.distance = distance
+    # 头像要按地址判，跟距离无关：距离 22 的「同一个人头像」照样不是帖子，
+    # 视觉复核把它当命中只会让人点进主页对不上图。
+    candidate.avatar = is_avatar_image(candidate.image_url)
     # X 的主页、转发/点赞/回复列表页上出现的图，发布者是别人。指纹对上只能说明
     # 「这张图在这一页里出现过」，不能说明是这个号的帖子，所以不能当原帖发出去。
     page_kind = x_page_kind(candidate.url)
-    if distance <= threshold and page_kind and page_kind != "post":
-        label = X_PAGE_LABELS.get(page_kind, "页面")
-        candidate.status = "suspect"
-        candidate.note = f"指纹一致（距离 {distance}），但这是 X 的{label}，不是哪条帖子"
-    elif distance <= threshold and is_avatar_image(candidate.image_url):
+    if distance <= threshold and candidate.avatar:
         # 头像对上只说明「这张图被这个账号拿去当头像」：页面本身往往不显示它，
         # 点进去看不到图，也不能当原帖出处。名字多半是站点标题，一并清掉。
         candidate.status = "suspect"
-        candidate.avatar = True
         candidate.note = f"{AVATAR_NOTE}（指纹距离 {distance}），不是帖子原图"
         candidate.name = ""
         candidate.handle = ""
+    elif distance <= threshold and page_kind and page_kind != "post":
+        label = X_PAGE_LABELS.get(page_kind, "页面")
+        candidate.status = "suspect"
+        candidate.note = f"指纹一致（距离 {distance}），但这是 X 的{label}，不是哪条帖子"
     elif distance <= threshold:
         candidate.status = "match"
         candidate.note = f"指纹一致（距离 {distance}）"

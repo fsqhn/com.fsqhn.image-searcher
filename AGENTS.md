@@ -93,7 +93,7 @@ core/maibot_compat.py  能力返回值解包
 
 **没找到时别把「疑似」说成「快找到了」**：`not_found` 的参考区上方要写明「另有 N 条是同角色或同款服装的图（指纹距离 a～b），不是这张照片本身」，距离取 suspect 里的 min～max，相等时不写区间。写成「疑似同图」会让 20 多距离的照骗看起来像是差一点就命中。
 
-**头像对上不算原帖**：Lens 会把页面里的账号头像、站点图标当结果图返回，距离能到 0。`verify_candidate` 在距离通过阈值后用 `is_avatar_image()`（地址含 `avatar` / `logo` / `favicon`）降到 suspect，**置 `candidate.avatar = True`**，note 写「该图是站点账号头像（指纹距离 N），不是帖子原图」，并清空 `name` / `handle`（那多半是站点标题）。判定必须用 `is_avatar_hit()`（字段优先，旧摘要退回 note 前缀），不能只看 note——视觉复核降级会覆盖 note，靠字符串认会把头像又放回参考图。头像条目：不挑成顶部参考图（`reference_candidates()` 跳过）、不进「视觉复核最近一条」、视觉复核点到也跳过不计数、`formatting` 里单独一行说明且**不能算进「同角色或同款服装」**，否则同一张头像会同时被说成「像同一个人」和「不是这张」。
+**头像对上不算原帖**：Lens 会把页面里的账号头像、站点图标当结果图返回，距离能到 0，X 的头像地址还长成 `pbs.twimg.com/profile_images/...`，不带 avatar 字样。`verify_candidate` 一律按 `is_avatar_image()`（地址含 `avatar` / `logo` / `favicon` / `profile_images` / `profile_image` / `profile_pic`）置 `candidate.avatar = True`，**与距离无关**：距离 ≤ 阈值时降成 suspect 并清空 `name` / `handle`（那多半是站点标题），距离更远时保持 mismatch，但标记留着。判定统一走 `is_avatar_hit()`（字段优先，旧摘要退回 note 前缀和图片地址），不能只看 note——视觉复核降级会覆盖 note。头像条目：不挑成顶部参考图（`reference_candidates()` 跳过）、不进「视觉复核最近一条」、视觉复核点到也跳过（不当成「同一个人」，也不触发账号核对）、`formatting` 里单独一行说明且**不能算进「同角色或同款服装」**，否则同一张头像会同时被说成「像同一个人」和「不是这张」。
 
 **`x.com/i/status/<id>` 是有用的链接**：这种 X 内部跳转链接没有作者名，但 status id 是真的，fxtwitter 能顺着它解析出真实作者。`find_posts()` 只对这一种保留（handle 记空），别的保留路径（`home`、`search` 等）照样丢。核对成功后要把解析出来的账号回填到 `info["handle"]`，否则 `miss` 分支会因为「没账号」把帖子整个扔掉。
 
@@ -201,7 +201,7 @@ SSRF 防护在 `core/httpclient.is_public_url()`：非公网 http(s) 一律拒�
 python -m unittest discover -s tests -v
 ```
 
-目前 357 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
+目前 360 项。新增引擎适配、改阈值、改指纹逻辑、改缓存或账号归一规则时补用例。改动 `_verify` / `_rank` / 取图链路后，用真实图跑一次端到端，确认「匹配 → 最佳匹配 → 带图」不断。
 
 改完 `plugin.py` 必须重载验证：日志里应出现 `麦麦寻人已加载：… 上限=…` 与 `vX.Y.Z 加载成功`，且无 traceback。改源码会重启插件进程，内存里的任务表会重建。
 

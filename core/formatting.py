@@ -241,7 +241,7 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
                 grok_lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，落点是图库站、漫画站或商品页这类页面，不能当作者主页；其中最近的一条可能就包含这张图。"
+                    f"视觉复核挑出 {vision['downgraded']} 条，但都不能当原帖：落点在图库站、商品页这类页面，或账号最近没发过这张图；其中最近的一条可能就包含这张图。"
                 )
                 reason_line = _vision_reason(vision)
                 if reason_line:
@@ -280,7 +280,7 @@ def _best_block_core(outcome: SearchOutcome, *, skip_grok: bool = False) -> str:
         if vision.get("ok") and vision.get("checked"):
             if vision.get("downgraded"):
                 lines.append(
-                    f"视觉复核挑出 {vision['downgraded']} 条，落点是图库站、漫画站或商品页这类页面，不能当作者主页；其中最近的一条可能就包含这张图。"
+                    f"视觉复核挑出 {vision['downgraded']} 条，但都不能当原帖：落点在图库站、商品页这类页面，或账号最近没发过这张图；其中最近的一条可能就包含这张图。"
                 )
                 reason_line = _vision_reason(vision)
                 if reason_line:

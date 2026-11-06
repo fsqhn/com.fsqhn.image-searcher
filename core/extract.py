@@ -456,7 +456,15 @@ def is_crawler_placeholder(url: str) -> bool:
 AVATAR_NOTE = "该图是站点账号头像"
 
 
-_AVATAR_HINTS = ("avatar", "logo", "favicon")
+_AVATAR_HINTS = (
+    "avatar",
+    "logo",
+    "favicon",
+    # X / Twitter 的头像图：pbs.twimg.com/profile_images/<id>/xxx_400x400.jpg
+    "profile_images",
+    "profile_image",
+    "profile_pic",
+)
 
 
 def is_avatar_image(url: str = "") -> bool:

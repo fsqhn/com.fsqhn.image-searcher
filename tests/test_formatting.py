@@ -446,6 +446,31 @@ class GrokReferenceTest(unittest.TestCase):
         self.assertIn("视觉方案挑中的那张", blob)
         self.assertIn("指纹距离 24", blob)
 
+    def test_x_profile_image_is_treated_as_avatar_even_without_flag(self) -> None:
+        """s-20261106-1642：X 头像地址没被旧版识别，视觉还把它当成命中。"""
+        item = Candidate(
+            engine="lens",
+            url="https://x.com/lonely82089351",
+            title="lonely (@lonely82089351) / X",
+            image_url="https://pbs.twimg.com/profile_images/2062750521325391872/Gk7_NOC2_400x400.jpg",
+            distance=22,
+            status="suspect",
+        )
+        item.note = "视觉复核：疑似同一个人，但没在 @lonely82089351 最近的带图帖里翻到这张，仅供参考"
+        outcome = SearchOutcome(
+            status="not_found",
+            best=None,
+            candidates=[item],
+            image_b64="AAAA",
+            image_source=item.image_url,
+            total_candidates=1,
+        )
+        blob = json.dumps(build_forward_nodes(_task(outcome), command="盆地找鸡"), ensure_ascii=False)
+        self.assertIn("另有 1 条是站点账号头像", blob)
+        self.assertIn("这张是站点账号头像", blob)
+        self.assertNotIn("最接近的一条", blob)
+        self.assertNotIn("同角色或同款服装", blob)
+
     def test_reference_at_distance_zero_is_not_called_different(self) -> None:
         """距离 0 就是同一张，不能写成「不是同一张」。"""
         item = Candidate(

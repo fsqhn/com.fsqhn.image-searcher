@@ -273,7 +273,7 @@ class VisionDisplayTest(unittest.TestCase):
         )
         text = formatting._best_block(outcome)
         self.assertIn("3", text)
-        self.assertIn("不能当作者主页", text)
+        self.assertIn("都不能当原帖", text)
         self.assertNotIn("没有发现同一个人", text)
 
     def test_downgraded_pick_prints_its_link(self):

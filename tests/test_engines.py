@@ -166,6 +166,36 @@ class XPageKindTest(unittest.TestCase):
         self.assertEqual(result.name, "")
         self.assertEqual(result.handle, "")
 
+    def test_avatar_flag_survives_far_distance(self) -> None:
+        """s-20261106-1642 的实况：头像距离 22 不算命中，但也得标成头像。"""
+        from io import BytesIO
+        from unittest.mock import patch
+
+        from PIL import Image, ImageDraw
+
+        from core.hashing import dhash
+
+        def stripes(offset: int) -> bytes:
+            image = Image.new("RGB", (64, 64), (255, 255, 255))
+            draw = ImageDraw.Draw(image)
+            for index in range(0, 64, 8):
+                if (index // 8 + offset) % 2 == 0:
+                    draw.rectangle([index, 0, index + 7, 63], fill=(0, 0, 0))
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        candidate = Candidate(
+            engine="lens",
+            url="https://x.com/lonely82089351",
+            image_url="https://pbs.twimg.com/profile_images/2062750521325391872/Gk7_NOC2_400x400.jpg",
+        )
+        with patch("core.engines.download_image_multi", return_value=stripes(0)):
+            result = verify_candidate(candidate, dhash(stripes(1)), 8, "", 5)
+        self.assertEqual(result.status, "mismatch")
+        self.assertEqual(result.distance, 64)
+        self.assertTrue(result.avatar)
+
     def test_replies_page_is_not_the_original_post(self) -> None:
         """s-20261105-1423 的实况：把 AlbertGreen69 的回复列表页当成原帖主。"""
         result = self._verify("https://x.com/AlbertGreen69/with_replies")
